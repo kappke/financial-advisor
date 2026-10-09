@@ -90,6 +90,16 @@ class DisplayAliasPreference(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class ReviewedExpenseGroup(Base):
+    """User-accepted category sets for similar expense groups."""
+
+    __tablename__ = "reviewed_expense_groups"
+
+    group_key: Mapped[str] = mapped_column(String(500), primary_key=True)
+    categories: Mapped[list[str]] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class PluggySyncState(Base):
     """Rate-limit automatic upstream sync attempts without altering API snapshots."""
 
@@ -167,6 +177,10 @@ class RecurringPatternPreferenceBody(BaseModel):
 class DisplayAliasPreferenceBody(BaseModel):
     alias_key: str = Field(min_length=1, max_length=300)
     alias: str | None = Field(default=None, max_length=120)
+
+
+class ReviewedExpenseGroupBody(BaseModel):
+    categories: list[str] = Field(min_length=1, max_length=30)
 
 
 class PluggyClient:
@@ -576,6 +590,10 @@ def dashboard(db: Session = Depends(get_db)):
         row.alias_key: row.alias
         for row in db.scalars(select(DisplayAliasPreference)).all()
     }
+    reviewed_expense_groups = {
+        row.group_key: row.categories
+        for row in db.scalars(select(ReviewedExpenseGroup)).all()
+    }
     bills = list(bills_by_key.values())
     bills.sort(key=lambda bill: str(bill.get("dueDate") or ""), reverse=True)
     return {
@@ -586,6 +604,7 @@ def dashboard(db: Session = Depends(get_db)):
         "categoryOverrides": overrides,
         "recurringRules": recurring_rules,
         "displayAliases": display_aliases,
+        "reviewedExpenseGroups": reviewed_expense_groups,
         "lastSyncedAt": last_synced_at.isoformat() if last_synced_at else None,
     }
 
@@ -719,3 +738,30 @@ def set_display_alias(body: DisplayAliasPreferenceBody, db: Session = Depends(ge
         ))
     db.commit()
     return {"aliasKey": alias_key, "alias": alias}
+
+
+@app.put("/api/similar-expense-groups/{group_key}/hide", dependencies=[Depends(require_auth)])
+def hide_similar_expense_group(group_key: str, body: ReviewedExpenseGroupBody, db: Session = Depends(get_db)):
+    key = group_key.strip()
+    if not key or len(key) > 500:
+        raise HTTPException(status_code=400, detail="Invalid expense group key.")
+    categories = sorted({category.strip() for category in body.categories if category.strip()})
+    if not categories or any(len(category) > 120 for category in categories):
+        raise HTTPException(status_code=422, detail="Provide valid reviewed categories.")
+    existing = db.get(ReviewedExpenseGroup, key)
+    if existing:
+        existing.categories = categories
+        existing.updated_at = datetime.now(timezone.utc)
+    else:
+        db.add(ReviewedExpenseGroup(group_key=key, categories=categories))
+    db.commit()
+    return {"groupKey": key, "categories": categories}
+
+
+@app.delete("/api/similar-expense-groups/{group_key}/hide", dependencies=[Depends(require_auth)])
+def restore_similar_expense_group(group_key: str, db: Session = Depends(get_db)):
+    existing = db.get(ReviewedExpenseGroup, group_key)
+    if existing:
+        db.delete(existing)
+        db.commit()
+    return {"groupKey": group_key, "hidden": False}

@@ -472,6 +472,19 @@ function App() {
             await loadDashboard()
             setMessage(`Updated ${result.updated} similar expenses to “${category}”.`)
           }}
+          onGroupVisibilityChange={async (group, hidden) => {
+            const path = `/api/similar-expense-groups/${encodeURIComponent(group.key)}/hide`
+            const result = await api(path, hidden
+              ? { method: 'PUT', body: JSON.stringify({ categories: group.categories.map(([category]) => category) }) }
+              : { method: 'DELETE' })
+            setData((current) => {
+              const reviewedExpenseGroups = { ...(current?.reviewedExpenseGroups || {}) }
+              if (hidden) reviewedExpenseGroups[group.key] = result.categories
+              else delete reviewedExpenseGroups[group.key]
+              return { ...current, reviewedExpenseGroups }
+            })
+            setMessage(hidden ? 'Group hidden from category review.' : 'Group restored to category review.')
+          }}
         />}
 
         {activeTab === 'accounts' && <>
@@ -2059,9 +2072,10 @@ function buildSimilarExpenseGroups(transactions, overrides, displayAliases = {})
       || a.source.localeCompare(b.source))
 }
 
-function SimilarExpenseGroupRow({ group, overrides, onSave }) {
+function SimilarExpenseGroupRow({ group, overrides, onSave, onHide }) {
   const [draft, setDraft] = useState(group.suggestedCategory)
   const [saving, setSaving] = useState(false)
+  const [hiding, setHiding] = useState(false)
   const [error, setError] = useState('')
   useEffect(() => setDraft(group.suggestedCategory), [group.key, group.suggestedCategory])
   const alreadyAssigned = Boolean(draft.trim()) && group.targetRows.every((transaction) => transactionCategory(transaction, overrides) === draft.trim())
@@ -2078,9 +2092,16 @@ function SimilarExpenseGroupRow({ group, overrides, onSave }) {
       setSaving(false)
     }
   }
+  const hide = async () => {
+    setHiding(true)
+    setError('')
+    try { await onHide(group, true) }
+    catch (err) { setError(err.message || 'Could not hide this group.') }
+    finally { setHiding(false) }
+  }
   return <div className="grid min-w-0 gap-3 rounded-xl border border-[#edf1ee] bg-[#171320] p-3 sm:grid-cols-[minmax(0,1fr)_minmax(210px,290px)] sm:items-center">
     <div className="min-w-0">
-      <div className="flex min-w-0 flex-wrap items-center gap-2"><p className="break-words text-xs font-bold">{group.source}</p><span className="rounded-full bg-[#28243e] px-2 py-0.5 text-[10px] font-bold text-muted">{group.rows.length} expenses</span>{group.uncategorizedCount > 0 && <span className="rounded-full bg-[#352125] px-2 py-0.5 text-[10px] font-bold text-[#f18a82]">{group.uncategorizedCount} uncategorized</span>}</div>
+      <div className="flex min-w-0 flex-wrap items-center gap-2"><p className="break-words text-xs font-bold">{group.source}</p><span className="rounded-full bg-[#28243e] px-2 py-0.5 text-[10px] font-bold text-muted">{group.rows.length} expenses</span>{group.uncategorizedCount > 0 && <span className="rounded-full bg-[#352125] px-2 py-0.5 text-[10px] font-bold text-[#f18a82]">{group.uncategorizedCount} uncategorized</span>}{group.uncategorizedCount === 0 && <button type="button" className="small-outline" onClick={hide} disabled={hiding}>{hiding ? 'Hiding…' : 'Hide reviewed'}</button>}</div>
       <p className="mt-1 text-[10px] text-muted">{formatCurrencyTotals(group.totals)} · {group.accountList.join(' · ')}</p>
       <p className="mt-1 break-words text-[10px] text-muted">Current: {group.categories.map(([category, count]) => `${category} (${count})`).join(' · ')}</p>
       {error && <p className="mt-1 text-[10px] text-rose-600" role="alert">{error}</p>}
@@ -2092,15 +2113,22 @@ function SimilarExpenseGroupRow({ group, overrides, onSave }) {
   </div>
 }
 
-function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, setSearch, onCategorySave, onBulkCategorySave }) {
+function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, setSearch, onCategorySave, onBulkCategorySave, onGroupVisibilityChange }) {
   const overrides = data?.categoryOverrides || {}
   const displayAliases = data?.displayAliases || {}
   const transactions = data?.transactions || []
   const [similarSearch, setSimilarSearch] = useState('')
   const [showAllSimilarGroups, setShowAllSimilarGroups] = useState(false)
+  const [visibilityError, setVisibilityError] = useState('')
   const similarGroups = useMemo(() => buildSimilarExpenseGroups(transactions, overrides, displayAliases), [transactions, overrides, displayAliases])
+  const reviewedGroups = data?.reviewedExpenseGroups || {}
+  const isReviewed = (group) => JSON.stringify(group.categories.map(([category]) => category).sort()) === JSON.stringify([...(reviewedGroups[group.key] || [])].sort())
+  const activeSimilarGroups = similarGroups.filter((group) => !isReviewed(group))
+  const hiddenSimilarGroups = similarGroups.filter(isReviewed)
   const categorySuggestions = categoriesForAutocomplete(transactions, overrides)
-  const filteredSimilarGroups = similarGroups.filter((group) => !similarSearch.trim() || `${group.source} ${group.accountList.join(' ')} ${group.categories.map(([category]) => category).join(' ')}`.toLowerCase().includes(similarSearch.trim().toLowerCase()))
+  const matchesSimilarSearch = (group) => !similarSearch.trim() || `${group.source} ${group.accountList.join(' ')} ${group.categories.map(([category]) => category).join(' ')}`.toLowerCase().includes(similarSearch.trim().toLowerCase())
+  const filteredSimilarGroups = activeSimilarGroups.filter(matchesSimilarSearch)
+  const filteredHiddenGroups = hiddenSimilarGroups.filter(matchesSimilarSearch)
   const visibleSimilarGroups = showAllSimilarGroups || similarSearch.trim() ? filteredSimilarGroups : filteredSimilarGroups.slice(0, 12)
   const categories = [...new Set(transactions.map((tx) => transactionCategory(tx, overrides)))].sort((a, b) => a.localeCompare(b))
   const filtered = transactions.filter((tx) => {
@@ -2117,13 +2145,21 @@ function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, se
       </div>
       {similarGroups.length > 0 && <div className="mb-6 rounded-2xl border border-[#edf1ee] bg-[#171320] p-4">
         <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
-          <div><h3 className="text-sm font-extrabold">Group similar expenses</h3><p className="mt-1 text-[10px] text-muted">Repeated merchant and description patterns are grouped together. Mixed or uncategorized groups come first.</p></div>
-          <span className="rounded-full border border-[#edf1ee] bg-[#fafcfb] px-3 py-1.5 text-[10px] font-bold text-muted">{similarGroups.length} groups · {similarGroups.reduce((sum, group) => sum + group.rows.length, 0)} expenses</span>
+          <div><h3 className="text-sm font-extrabold">Group similar expenses</h3><p className="mt-1 text-[10px] text-muted">Repeated patterns are grouped together. Hide a fully categorized group once you agree with its categories; new category changes bring it back for review.</p></div>
+          <span className="rounded-full border border-[#edf1ee] bg-[#fafcfb] px-3 py-1.5 text-[10px] font-bold text-muted">{activeSimilarGroups.length} to review · {hiddenSimilarGroups.length} hidden</span>
         </div>
         <div className="relative mb-3 min-w-0"><Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-muted" /><input className="input h-10 pl-10" value={similarSearch} onChange={(event) => setSimilarSearch(event.target.value)} placeholder="Find a merchant or current category" aria-label="Search similar expense groups" /></div>
         <datalist id="expense-category-suggestions">{categorySuggestions.map((category) => <option key={category} value={category} />)}</datalist>
-        {visibleSimilarGroups.length ? <div className="grid min-w-0 gap-2">{visibleSimilarGroups.map((group) => <SimilarExpenseGroupRow key={group.key} group={group} overrides={overrides} onSave={onBulkCategorySave} />)}</div> : <p className="py-5 text-center text-xs text-muted">No similar expense groups match that search.</p>}
+        {visibleSimilarGroups.length ? <div className="grid min-w-0 gap-2">{visibleSimilarGroups.map((group) => <SimilarExpenseGroupRow key={group.key} group={group} overrides={overrides} onSave={onBulkCategorySave} onHide={onGroupVisibilityChange} />)}</div> : <p className="py-5 text-center text-xs text-muted">{activeSimilarGroups.length ? 'No groups to review match that search.' : 'All similar expense groups have been reviewed.'}</p>}
         {!showAllSimilarGroups && !similarSearch.trim() && filteredSimilarGroups.length > visibleSimilarGroups.length && <button type="button" className="small-outline mt-3 w-full" onClick={() => setShowAllSimilarGroups(true)}>Show all {filteredSimilarGroups.length} groups</button>}
+        {hiddenSimilarGroups.length > 0 && <details className="mt-4 rounded-xl border border-[#2d2537] p-3">
+          <summary className="cursor-pointer text-xs font-bold">Reviewed groups ({filteredHiddenGroups.length})</summary>
+          <div className="mt-3 grid gap-2">{filteredHiddenGroups.map((group) => <div key={group.key} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg bg-[#17131f] p-3">
+            <div className="min-w-0"><p className="break-words text-xs font-bold">{group.source}</p><p className="mt-1 break-words text-[10px] text-muted">{group.categories.map(([category]) => category).join(' · ')} · {group.rows.length} expenses</p></div>
+            <button type="button" className="small-outline" onClick={async () => { setVisibilityError(''); try { await onGroupVisibilityChange(group, false) } catch (err) { setVisibilityError(err.message || 'Could not restore this group.') } }}>Restore</button>
+          </div>)}{!filteredHiddenGroups.length && <p className="text-xs text-muted">No reviewed groups match that search.</p>}</div>
+        </details>}
+        {visibilityError && <p className="mt-2 text-xs text-rose-600" role="alert">{visibilityError}</p>}
       </div>}
       <div className="mb-4 flex min-w-0 flex-col gap-2 sm:flex-row">
         <div className="relative w-full min-w-0 flex-1"><Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-muted" /><input className="input h-10 pl-10" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search description or account" /></div>
