@@ -605,10 +605,10 @@ function MonthStat({ data, kind }) {
   const transactions = data?.transactions || []
   const accountCurrencies = [...new Set((data?.accounts || []).map((account) => account.currencyCode).filter(Boolean))]
   const currency = accountCurrencies.includes('BRL') ? 'BRL' : accountCurrencies[0] || 'BRL'
-  const now = new Date()
+  const currentMonth = currentFinanceMonth()
   const current = transactions.filter((tx) => {
     const date = parseFinanceDate(tx.date)
-    return date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && (!tx.status || tx.status === 'POSTED') && (tx.currencyCode || 'BRL') === currency
+    return !Number.isNaN(date.getTime()) && String(tx.date || '').slice(0, 7) === currentMonth && isPosted(tx) && (tx.currencyCode || 'BRL') === currency
   })
   const exp = current.filter((tx) => isExpense(tx) && !isInternalTransfer(tx)).reduce((sum, tx) => sum + expenseValue(tx), 0)
   const income = current.filter((tx) => !isExpense(tx) && tx._accountType !== 'CREDIT' && !isInternalTransfer(tx)).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0)
@@ -951,14 +951,14 @@ function buildRecurringInsights(data, preferredCurrency = null) {
   const currency = accountCurrencies.includes(preferredCurrency)
     ? preferredCurrency
     : accountCurrencies.includes('BRL') ? 'BRL' : accountCurrencies[0] || 'BRL'
-  const now = new Date()
-  const cutoff = new Date(now)
-  cutoff.setFullYear(cutoff.getFullYear() - 1)
+  const currentMonth = currentFinanceMonth()
+  const firstMonth = shiftOutlookMonth(currentMonth, -11)
   const recent = (data?.transactions || []).filter((tx) => {
     const date = parseFinanceDate(tx.date)
+    const month = String(tx.date || '').slice(0, 7)
     return !Number.isNaN(date.getTime())
-      && date >= cutoff
-      && date <= now
+      && month >= firstMonth
+      && month <= currentMonth
       && isPosted(tx)
       && (tx.currencyCode || 'BRL') === currency
   })
@@ -1098,13 +1098,13 @@ function RecurringDashboard({ data, onRuleSave }) {
     const rule = recurringRules[expense.key] || {}
     const editing = editingKey === expense.key
     const monthAmount = monthlyExpenseAmount(expense, selectedMonth)
-    const scaledAllocations = expense.categoryAllocations.length && expense.mean > 0
-      ? expense.categoryAllocations.map((allocation) => ({ ...allocation, amount: Number(allocation.amount) * monthAmount / expense.mean }))
+    const scaledAllocations = expense.categoryAllocations.length
+      ? allocatedCategoryAmounts(expense, monthAmount, expense.category)
       : null
     const monthCategoryAmounts = expense.categoryAmountsByMonth?.get(selectedMonth) || []
     const allocationsToShow = outlookMode === 'month'
       ? scaledAllocations || monthCategoryAmounts
-      : expense.categoryAllocations.length ? expense.categoryAllocations : expense.categoryAmounts
+      : expense.categoryAllocations.length ? allocatedCategoryAmounts(expense, expense.mean, expense.category) : expense.categoryAmounts
     const categorySummary = allocationsToShow.map((allocation) => `${allocation.category}: ${money(allocation.amount, currency)}`).join(' · ')
     const transactionCount = expense.allMonthlyCounts?.get(selectedMonth) || 0
     const sourceAccountsToShow = outlookMode === 'month'
@@ -1150,9 +1150,16 @@ function RecurringDashboard({ data, onRuleSave }) {
           {editing && <form className="mt-3 grid min-w-0 gap-2 sm:max-w-[640px]" onSubmit={(event) => {
             event.preventDefault()
             if (editingField === 'alias') void persistRule(expense, { alias: draftAlias.trim() || null })
-            else void persistRule(expense, { categoryAllocations: draftAllocations
-              .map((allocation) => ({ category: allocation.category.trim(), amount: Number(allocation.amount) }))
-              .filter((allocation) => allocation.category && Number.isFinite(allocation.amount) && allocation.amount > 0) })
+            else {
+              const allocations = draftAllocations
+                .map((allocation) => ({ category: allocation.category.trim(), amount: Number(allocation.amount) }))
+                .filter((allocation) => allocation.category && Number.isFinite(allocation.amount) && allocation.amount > 0)
+              if (allocations.reduce((sum, allocation) => sum + allocation.amount, 0) > expense.mean + 0.005) {
+                setRuleError(`Assigned categories exceed the ${money(expense.mean, currency)} monthly average for this expense.`)
+                return
+              }
+              void persistRule(expense, { categoryAllocations: allocations })
+            }
           }}>
             {editingField === 'alias' ? <input className="input h-10 min-w-0 flex-1" maxLength={120} value={draftAlias} onChange={(event) => setDraftAlias(event.target.value)} placeholder={expense.source} aria-label="Recurring pattern alias" /> : <>
               <p className="text-[11px] text-muted">Set a monthly amount for each category. These allocations do not change the total recurring expense.</p>
@@ -1480,6 +1487,19 @@ function monthlyExpenseAmount(expense, month) {
   return Number(amounts?.get(month) || 0)
 }
 
+function allocatedCategoryAmounts(expense, amount, fallbackCategory) {
+  const allocations = (expense.categoryAllocations || []).filter((row) => row.category && Number(row.amount) > 0)
+  if (!allocations.length || !Number.isFinite(expense.mean) || expense.mean <= 0) return [{ category: fallbackCategory, amount }]
+  const requested = allocations.reduce((sum, row) => sum + Number(row.amount), 0)
+  const assigned = amount * Math.min(1, requested / expense.mean)
+  const totals = new Map()
+  for (const row of allocations) {
+    totals.set(row.category, (totals.get(row.category) || 0) + assigned * Number(row.amount) / requested)
+  }
+  if (amount - assigned > 0.005) totals.set(fallbackCategory, (totals.get(fallbackCategory) || 0) + amount - assigned)
+  return [...totals].map(([category, value]) => ({ category, amount: value }))
+}
+
 function buildInstallmentPlans(data) {
   const displayAliases = data?.displayAliases || {}
   const accountsById = new Map((data?.accounts || []).map((account) => [String(account.id), account]))
@@ -1798,25 +1818,19 @@ function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
     const cutoff = new Date()
     cutoff.setDate(cutoff.getDate() - days)
     const totals = new Map()
-    const allocationByTransaction = new Map()
+    const patternByTransaction = new Map()
     for (const pattern of buildRecurringInsights(data, activeCurrency).recurringExpenses) {
-      const allocations = (pattern.categoryAllocations || []).filter((allocation) => allocation.category && Number(allocation.amount) > 0)
-      if (!allocations.length) continue
-      for (const transaction of pattern.rows) allocationByTransaction.set(String(transaction.id), allocations)
+      if (!pattern.categoryAllocations?.length) continue
+      for (const transaction of pattern.rows) patternByTransaction.set(String(transaction.id), pattern)
     }
     for (const tx of data?.transactions || []) {
       if (!isExpense(tx) || isInternalTransfer(tx) || !isPosted(tx) || parseFinanceDate(tx.date) < cutoff || (tx.currencyCode || 'BRL') !== activeCurrency) continue
       const amount = expenseValue(tx)
-      const allocations = allocationByTransaction.get(String(tx.id))
-      const allocationTotal = allocations?.reduce((sum, allocation) => sum + Number(allocation.amount), 0) || 0
-      if (allocationTotal > 0) {
-        for (const allocation of allocations) {
-          const categoryAmount = amount * Number(allocation.amount) / allocationTotal
-          totals.set(allocation.category, (totals.get(allocation.category) || 0) + categoryAmount)
-        }
-      } else {
-        const category = transactionCategory(tx, overrides)
-        totals.set(category, (totals.get(category) || 0) + amount)
+      const category = transactionCategory(tx, overrides)
+      const pattern = patternByTransaction.get(String(tx.id))
+      const categoryAmounts = pattern ? allocatedCategoryAmounts(pattern, amount, category) : [{ category, amount }]
+      for (const row of categoryAmounts) {
+        totals.set(row.category, (totals.get(row.category) || 0) + row.amount)
       }
     }
     return [...totals.entries()].map(([category, amount]) => ({ category, amount })).sort((a, b) => b.amount - a.amount).slice(0, 7)

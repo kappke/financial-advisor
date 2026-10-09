@@ -104,13 +104,19 @@ def get_db():
         yield db
 
 
+def password_version() -> str:
+    return hmac.new(SESSION_SECRET.encode("utf-8"), APP_PASSWORD.encode("utf-8"), "sha256").hexdigest()
+
+
 def is_authenticated(request: Request) -> bool:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         return False
     try:
         claims = serializer.loads(token, max_age=SESSION_MAX_AGE)
-        return claims == {"authenticated": True}
+        return isinstance(claims, dict) and claims.get("authenticated") is True and hmac.compare_digest(
+            str(claims.get("passwordVersion", "")), password_version()
+        )
     except (BadSignature, TypeError, ValueError):
         return False
 
@@ -412,7 +418,7 @@ def login(body: LoginBody, response: Response):
         raise HTTPException(status_code=503, detail="Set APP_PASSWORD and SESSION_SECRET in the environment first.")
     if not hmac.compare_digest(body.password.encode("utf-8"), APP_PASSWORD.encode("utf-8")):
         raise HTTPException(status_code=401, detail="That password did not match.")
-    token = serializer.dumps({"authenticated": True})
+    token = serializer.dumps({"authenticated": True, "passwordVersion": password_version()})
     response.set_cookie(
         COOKIE_NAME,
         token,

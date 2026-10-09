@@ -54,7 +54,7 @@ Existing connections can be imported with **Import existing**. This uses Pluggy'
 ## Security notes
 
 - Keep `.env` private. Do not commit it or expose `PLUGGY_CLIENT_SECRET` in the browser.
-- The session cookie is HttpOnly, SameSite Strict, and signed with `SESSION_SECRET`.
+- The session cookie is HttpOnly, SameSite Strict, and signed with `SESSION_SECRET`. Changing `APP_PASSWORD` invalidates existing sessions after the app restarts.
 - The database is only exposed to the internal Compose network. Keep the host port private if you add one.
 - For remote access, put the web service behind HTTPS and set `COOKIE_SECURE=true`.
 - Anyone with access to the database volume can read the raw bank data stored there; protect the machine and its backups accordingly.
