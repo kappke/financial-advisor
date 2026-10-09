@@ -47,6 +47,8 @@ The `api_digest` table stores the complete JSON response body for each financial
 
 The `category_overrides` table contains only app-owned transaction category edits. These edits are applied when building the dashboard and do not alter the original Pluggy JSON snapshot or call Pluggy's transaction update endpoint. Authentication/API credentials and short-lived API or Connect Tokens are not persisted.
 
+The `card_payment_markers` table separately tracks bank movements that pay credit card bills. Marked payments stay visible with their own category, but are excluded from spending totals and recurring-expense analysis so card purchases are not counted twice. This marker does not reassign purchase dates or create inferred card transactions.
+
 The `reviewed_expense_groups` table remembers similar-expense groups hidden after category review. A group returns to the review list when its set of categories changes, and it can be restored from the collapsed Reviewed groups section.
 
 Pluggy's transaction API currently makes up to 12 months of transactions available. The app uses `/v2/transactions` cursor pagination, account-list page pagination, and the credit card bills endpoint. Item data is synced only after Pluggy reports `UPDATED` with `SUCCESS` or `PARTIAL_SUCCESS`; while a connection is still running or awaiting user input, its status is retained and the last complete snapshot stays available.

@@ -68,6 +68,15 @@ class CategoryOverride(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class CardPaymentMarker(Base):
+    """App-owned spending treatment for bank movements that settle card purchases."""
+
+    __tablename__ = "card_payment_markers"
+
+    transaction_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    marked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class RecurringPatternPreference(Base):
     """User-managed names, category allocations, and exclusions for recurring patterns."""
 
@@ -582,6 +591,7 @@ def dashboard(db: Session = Depends(get_db)):
         })
     transactions.sort(key=lambda tx: str(tx.get("date") or ""), reverse=True)
     overrides = {row.transaction_id: row.category for row in db.scalars(select(CategoryOverride)).all()}
+    card_payment_ids = [row.transaction_id for row in db.scalars(select(CardPaymentMarker)).all()]
     recurring_rules = {
         row.pattern_key: {"alias": row.alias, "categoryAllocations": row.category_allocations or [], "excluded": row.excluded}
         for row in db.scalars(select(RecurringPatternPreference)).all()
@@ -602,6 +612,7 @@ def dashboard(db: Session = Depends(get_db)):
         "transactions": transactions,
         "bills": bills,
         "categoryOverrides": overrides,
+        "cardPaymentTransactionIds": card_payment_ids,
         "recurringRules": recurring_rules,
         "displayAliases": display_aliases,
         "reviewedExpenseGroups": reviewed_expense_groups,
@@ -633,6 +644,29 @@ def set_transaction_category(transaction_id: str, body: CategoryBody, db: Sessio
         db.add(CategoryOverride(transaction_id=transaction_id, category=category, updated_at=datetime.now(timezone.utc)))
     db.commit()
     return {"transactionId": transaction_id, "category": category}
+
+
+@app.put("/api/transactions/{transaction_id}/card-payment", dependencies=[Depends(require_auth)])
+def mark_card_payment(transaction_id: str, db: Session = Depends(get_db)):
+    pages = db.scalars(select(ApiDigest.raw_json).where(ApiDigest.resource_type == "transactions")).all()
+    transaction = next((tx for page in pages for tx in (page.get("results") or []) if str(tx.get("id")) == transaction_id), None)
+    if transaction is None:
+        raise HTTPException(status_code=404, detail="Transaction not found in the latest snapshots.")
+    if transaction.get("type") != "DEBIT" and not (not transaction.get("type") and float(transaction.get("amount") or 0) < 0):
+        raise HTTPException(status_code=400, detail="Only outgoing movements can be marked as card payments.")
+    if db.get(CardPaymentMarker, transaction_id) is None:
+        db.add(CardPaymentMarker(transaction_id=transaction_id))
+        db.commit()
+    return {"transactionId": transaction_id, "cardPayment": True}
+
+
+@app.delete("/api/transactions/{transaction_id}/card-payment", dependencies=[Depends(require_auth)])
+def unmark_card_payment(transaction_id: str, db: Session = Depends(get_db)):
+    marker = db.get(CardPaymentMarker, transaction_id)
+    if marker:
+        db.delete(marker)
+        db.commit()
+    return {"transactionId": transaction_id, "cardPayment": False}
 
 
 @app.patch("/api/transactions/categories", dependencies=[Depends(require_auth)])

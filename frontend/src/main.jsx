@@ -112,11 +112,12 @@ function transactionAccountLabel(transaction, displayAliases = {}) {
   return institutionName ? `${accountName} · ${institutionName}` : accountName
 }
 
-const isInternalTransfer = (transaction, overrides = {}) => {
+const isInternalTransfer = (transaction, overrides = {}, cardPaymentIds = new Set()) => {
   const categoryId = String(transaction.categoryId || '')
   const category = String(transactionCategory(transaction, overrides)).trim().toLowerCase()
   const operationType = String(transaction.operationType || '').toUpperCase()
-  return categoryId.startsWith('04')
+  return cardPaymentIds.has(String(transaction.id))
+    || categoryId.startsWith('04')
     || categoryId.startsWith('0506')
     || categoryId.startsWith('0510')
     || category.startsWith('same person transfer')
@@ -472,6 +473,16 @@ function App() {
             await loadDashboard()
             setMessage(`Updated ${result.updated} similar expenses to “${category}”.`)
           }}
+          onCardPaymentChange={async (transactionId, marked) => {
+            await api(`/api/transactions/${encodeURIComponent(transactionId)}/card-payment`, { method: marked ? 'PUT' : 'DELETE' })
+            setData((current) => {
+              const ids = new Set(current?.cardPaymentTransactionIds || [])
+              if (marked) ids.add(transactionId)
+              else ids.delete(transactionId)
+              return { ...current, cardPaymentTransactionIds: [...ids] }
+            })
+            setMessage(marked ? 'Card bill payment excluded from spending.' : 'Movement restored to spending totals.')
+          }}
           onGroupVisibilityChange={async (group, hidden) => {
             const path = `/api/similar-expense-groups/${encodeURIComponent(group.key)}/hide`
             const result = await api(path, hidden
@@ -617,6 +628,7 @@ function BalanceHero({ data, onRefresh, refreshing }) {
 function MonthStat({ data, kind }) {
   const transactions = data?.transactions || []
   const overrides = data?.categoryOverrides || {}
+  const cardPaymentIds = new Set(data?.cardPaymentTransactionIds || [])
   const accountCurrencies = [...new Set((data?.accounts || []).map((account) => account.currencyCode).filter(Boolean))]
   const currency = accountCurrencies.includes('BRL') ? 'BRL' : accountCurrencies[0] || 'BRL'
   const currentMonth = currentFinanceMonth()
@@ -624,8 +636,8 @@ function MonthStat({ data, kind }) {
     const date = parseFinanceDate(tx.date)
     return !Number.isNaN(date.getTime()) && String(tx.date || '').slice(0, 7) === currentMonth && isPosted(tx) && (tx.currencyCode || 'BRL') === currency
   })
-  const exp = current.filter((tx) => isExpense(tx) && !isInternalTransfer(tx, overrides)).reduce((sum, tx) => sum + expenseValue(tx), 0)
-  const income = current.filter((tx) => !isExpense(tx) && tx._accountType !== 'CREDIT' && !isInternalTransfer(tx, overrides)).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0)
+  const exp = current.filter((tx) => isExpense(tx) && !isInternalTransfer(tx, overrides, cardPaymentIds)).reduce((sum, tx) => sum + expenseValue(tx), 0)
+  const income = current.filter((tx) => !isExpense(tx) && tx._accountType !== 'CREDIT' && !isInternalTransfer(tx, overrides, cardPaymentIds)).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0)
   const cards = (data?.accounts || []).filter((account) => account.type === 'CREDIT' && (account.currencyCode || 'BRL') === currency)
   const cardBalance = cards.reduce((sum, account) => sum + Math.max(0, Number(account.balance || 0)), 0)
   const values = {
@@ -685,7 +697,7 @@ function isCommonTaxOrFee(transaction) {
   return /\b(?:iof|tax(?:a|as|es)?|fees?|tarifas?|tariff|encargos?|impostos?|tributos?|anuidade|service charge|maintenance fee|bank charge)\b/.test(label)
 }
 
-function isRecurringExternalTransfer(tx, overrides = {}) {
+function isRecurringExternalTransfer(tx, overrides = {}, cardPaymentIds = new Set()) {
   const categoryId = String(tx.categoryId || '')
   const operationType = String(tx.operationType || '').toUpperCase()
   const merchant = typeof tx.merchant === 'string' ? tx.merchant : tx.merchant?.name || ''
@@ -694,7 +706,7 @@ function isRecurringExternalTransfer(tx, overrides = {}) {
   const generalTransferPix = categoryId.startsWith('0500') && operationType === 'PIX'
   if ((!explicitlyPix && !generalTransferPix)
     || tx._accountType === 'CREDIT'
-    || isInternalTransfer(tx, overrides)
+    || isInternalTransfer(tx, overrides, cardPaymentIds)
     || isBankSlipTransaction(tx)
     || operationType === 'CARTAO'
     || operationType === 'PAGAMENTO_FATURA'
@@ -841,11 +853,11 @@ function analyzeMonthlyPattern(transactions, overrides, displayAliases = {}) {
   }).filter((group) => group.isMonthly)
 }
 
-function buildEverydaySpendPatterns(transactions, overrides, displayAliases = {}) {
+function buildEverydaySpendPatterns(transactions, overrides, displayAliases = {}, cardPaymentIds = new Set()) {
   const groups = new Map()
   for (const transaction of transactions) {
     if (!isExpense(transaction)
-      || isInternalTransfer(transaction, overrides)
+      || isInternalTransfer(transaction, overrides, cardPaymentIds)
       || String(transaction.categoryId || '').startsWith('05')
       || isBankSlipTransaction(transaction)) continue
     const category = transactionCategory(transaction, overrides)
@@ -977,22 +989,23 @@ function buildRecurringInsights(data, preferredCurrency = null) {
       && (tx.currencyCode || 'BRL') === currency
   })
   const overrides = data?.categoryOverrides || {}
+  const cardPaymentIds = new Set(data?.cardPaymentTransactionIds || [])
   const displayAliases = data?.displayAliases || {}
   const expenseRows = recent.filter((tx) => {
     const category = transactionCategory(tx, overrides).toLowerCase()
-    const ordinaryExpense = !isInternalTransfer(tx, overrides)
+    const ordinaryExpense = !isInternalTransfer(tx, overrides, cardPaymentIds)
       && !String(tx.categoryId || '').startsWith('05')
       && !isBankSlipTransaction(tx)
     return isExpense(tx)
-      && (ordinaryExpense || isRecurringExternalTransfer(tx, overrides))
+      && (ordinaryExpense || isRecurringExternalTransfer(tx, overrides, cardPaymentIds))
       && !category.includes('investment')
       && !category.includes('investimento')
       && !variableSpendCategoryPattern.test(category.normalize('NFD').replace(/[\u0300-\u036f]/g, ''))
   })
   const recurringRules = data?.recurringRules || {}
   const sourcePatterns = analyzeMonthlyPattern(expenseRows, overrides, displayAliases)
-    .filter((group) => group.monthCount >= 5 && (!group.transferPattern || group.rows.filter((tx) => isRecurringExternalTransfer(tx, overrides)).length >= 5))
-  const everydayPatterns = buildEverydaySpendPatterns(recent, overrides, displayAliases)
+    .filter((group) => group.monthCount >= 5 && (!group.transferPattern || group.rows.filter((tx) => isRecurringExternalTransfer(tx, overrides, cardPaymentIds)).length >= 5))
+  const everydayPatterns = buildEverydaySpendPatterns(recent, overrides, displayAliases, cardPaymentIds)
   const recurringExpenses = [...sourcePatterns, ...everydayPatterns]
     .map((group) => ({
       ...group,
@@ -1009,7 +1022,7 @@ function buildRecurringInsights(data, preferredCurrency = null) {
     return tx._accountType !== 'CREDIT'
       && !isExpense(tx)
       && Number(tx.amount) > 0
-      && !isInternalTransfer(tx, overrides)
+      && !isInternalTransfer(tx, overrides, cardPaymentIds)
       && !String(tx.categoryId || '').startsWith('05')
       && !excludedIncomeWords.test(label)
   })
@@ -1825,6 +1838,7 @@ function InstallmentBillsDashboard({ data }) {
 
 function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
   const overrides = data?.categoryOverrides || {}
+  const cardPaymentIds = new Set(data?.cardPaymentTransactionIds || [])
   const displayAliases = data?.displayAliases || {}
   const currencies = [...new Set((data?.accounts || []).map((account) => account.currencyCode).filter(Boolean))]
   if (!currencies.length) currencies.push('BRL')
@@ -1840,7 +1854,7 @@ function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
       for (const transaction of pattern.rows) patternByTransaction.set(String(transaction.id), pattern)
     }
     for (const tx of data?.transactions || []) {
-      if (!isExpense(tx) || isInternalTransfer(tx, overrides) || !isPosted(tx) || parseFinanceDate(tx.date) < cutoff || (tx.currencyCode || 'BRL') !== activeCurrency) continue
+      if (!isExpense(tx) || isInternalTransfer(tx, overrides, cardPaymentIds) || !isPosted(tx) || parseFinanceDate(tx.date) < cutoff || (tx.currencyCode || 'BRL') !== activeCurrency) continue
       const amount = expenseValue(tx)
       const category = transactionCategory(tx, overrides)
       const pattern = patternByTransaction.get(String(tx.id))
@@ -2132,8 +2146,9 @@ function SimilarExpenseGroupRow({ group, overrides, onSave, onHide }) {
   </div>
 }
 
-function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, setSearch, onCategorySave, onBulkCategorySave, onGroupVisibilityChange }) {
+function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, setSearch, onCategorySave, onBulkCategorySave, onCardPaymentChange, onGroupVisibilityChange }) {
   const overrides = data?.categoryOverrides || {}
+  const markedPayments = new Set(data?.cardPaymentTransactionIds || [])
   const displayAliases = data?.displayAliases || {}
   const transactions = data?.transactions || []
   const [similarSearch, setSimilarSearch] = useState('')
@@ -2186,16 +2201,18 @@ function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, se
       </div>
       <div className="transaction-header hidden grid-cols-[minmax(0,1.5fr)_minmax(110px,0.75fr)_minmax(125px,0.8fr)_minmax(110px,0.7fr)] gap-4 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.1em] text-muted md:grid"><span>Movement</span><span>Date</span><span>Category</span><span className="text-right">Amount</span></div>
       <div className="divide-y divide-[#edf1ee]">
-        {filtered.map((transaction) => <TransactionRow key={transaction.id} transaction={transaction} category={transactionCategory(transaction, overrides)} categories={categories} displayAliases={displayAliases} onSave={onCategorySave} />)}
+        {filtered.map((transaction) => <TransactionRow key={transaction.id} transaction={transaction} category={transactionCategory(transaction, overrides)} categories={categories} displayAliases={displayAliases} cardPaymentMarked={markedPayments.has(String(transaction.id))} onCardPaymentChange={onCardPaymentChange} onSave={onCategorySave} />)}
       </div>
       {!filtered.length && <EmptyState icon={<ArrowLeftRight size={20} />} title="Nothing found" detail={transactions.length ? 'Try another search or category.' : 'Connect an account and sync your first transactions.'} />}
     </section>
   )
 }
 
-function TransactionRow({ transaction, category, categories, displayAliases, onSave }) {
+function TransactionRow({ transaction, category, categories, displayAliases, cardPaymentMarked, onCardPaymentChange, onSave }) {
   const [draft, setDraft] = useState(category)
   const [editing, setEditing] = useState(false)
+  const [paymentBusy, setPaymentBusy] = useState(false)
+  const [paymentError, setPaymentError] = useState('')
   useEffect(() => setDraft(category), [category])
   const expense = isExpense(transaction)
   const amount = Number(transaction.amount || 0)
@@ -2204,14 +2221,21 @@ function TransactionRow({ transaction, category, categories, displayAliases, onS
     if (normalized !== category) await onSave(transaction.id, normalized)
     setEditing(false)
   }
+  const toggleCardPayment = async () => {
+    setPaymentBusy(true)
+    setPaymentError('')
+    try { await onCardPaymentChange(String(transaction.id), !cardPaymentMarked) }
+    catch (error) { setPaymentError(error.message || 'Could not update this payment.') }
+    finally { setPaymentBusy(false) }
+  }
   return <div className="transaction-row grid grid-cols-1 gap-2 px-4 py-3.5 md:grid-cols-[minmax(0,1.5fr)_minmax(110px,0.75fr)_minmax(125px,0.8fr)_minmax(110px,0.7fr)] md:items-center md:gap-4">
     <div className="flex min-w-0 items-center gap-3">
       <div className={`movement-icon ${expense ? 'movement-expense' : 'movement-income'}`}>{expense ? <ArrowDownLeft size={16} /> : <ArrowUpRight size={16} />}</div>
-      <div className="min-w-0"><p className="truncate text-sm font-bold">{transaction.description || transaction.descriptionRaw || 'Transaction'}</p><p className="mt-0.5 truncate text-[10px] text-muted">{transactionAccountLabel(transaction, displayAliases)}</p></div>
+      <div className="min-w-0"><p className="truncate text-sm font-bold">{transaction.description || transaction.descriptionRaw || 'Transaction'}</p><p className="mt-0.5 truncate text-[10px] text-muted">{transactionAccountLabel(transaction, displayAliases)}</p>{cardPaymentMarked && <p className="mt-1 text-[10px] font-semibold text-violet-300">Card bill payment · excluded from spending</p>}</div>
     </div>
     <div className="flex items-center justify-between text-xs text-muted md:block"> <span className="mr-2 font-semibold md:hidden">Date</span><span>{dateLabel(transaction.date, { month: 'short', day: 'numeric', year: 'numeric' })}{transaction.status === 'PENDING' && <span className="ml-2 rounded-full bg-amber-50 px-2 py-0.5 text-[9px] font-bold text-amber-700">Pending</span>}</span></div>
     <div className="flex items-center justify-between gap-2"><span className="mr-2 text-xs font-semibold text-muted md:hidden">Category</span>
-      {editing ? <div className="flex w-full gap-1"><input className="category-input" list={`cats-${transaction.id}`} value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><datalist id={`cats-${transaction.id}`}>{categories.map((item) => <option key={item} value={item} />)}</datalist><button title="Save category" className="save-category" onClick={save}><Check size={14} /></button><button title="Cancel" className="cancel-category" onClick={() => { setDraft(category); setEditing(false) }}><X size={14} /></button></div> : <button className="category-pill" onClick={() => setEditing(true)} title="Click to edit category"><span>{category}</span><PencilLine size={11} /></button>}
+      {editing ? <div className="w-full min-w-0"><div className="flex w-full gap-1"><input className="category-input" list={`cats-${transaction.id}`} value={draft} onChange={(event) => setDraft(event.target.value)} autoFocus /><datalist id={`cats-${transaction.id}`}>{categories.map((item) => <option key={item} value={item} />)}</datalist><button title="Save category" className="save-category" onClick={save}><Check size={14} /></button><button title="Cancel" className="cancel-category" onClick={() => { setDraft(category); setEditing(false) }}><X size={14} /></button></div>{expense && transaction._accountType === 'BANK' && <button type="button" className="mt-2 text-left text-[10px] font-semibold text-violet-300" onClick={toggleCardPayment} disabled={paymentBusy}>{paymentBusy ? 'Saving…' : cardPaymentMarked ? 'Count this payment as spending' : 'Mark as card bill payment (exclude from spending)'}</button>}{paymentError && <p className="mt-1 text-[10px] text-rose-400" role="alert">{paymentError}</p>}</div> : <button className="category-pill" onClick={() => setEditing(true)} title="Click to edit category"><span>{category}</span><PencilLine size={11} /></button>}
     </div>
     <div className="flex items-center justify-between md:block md:text-right"><span className="text-xs font-semibold text-muted md:hidden">Amount</span><span className={`text-sm font-extrabold ${expense ? 'text-rose-600' : 'text-emerald-700'}`}>{expense ? '−' : '+'}{money(Math.abs(amount), transaction.currencyCode || 'BRL')}</span></div>
   </div>
