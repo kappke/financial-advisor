@@ -112,9 +112,9 @@ function transactionAccountLabel(transaction, displayAliases = {}) {
   return institutionName ? `${accountName} · ${institutionName}` : accountName
 }
 
-const isInternalTransfer = (transaction) => {
+const isInternalTransfer = (transaction, overrides = {}) => {
   const categoryId = String(transaction.categoryId || '')
-  const category = String(transaction.category || '').trim().toLowerCase()
+  const category = String(transactionCategory(transaction, overrides)).trim().toLowerCase()
   const operationType = String(transaction.operationType || '').toUpperCase()
   return categoryId.startsWith('04')
     || categoryId.startsWith('0506')
@@ -616,6 +616,7 @@ function BalanceHero({ data, onRefresh, refreshing }) {
 
 function MonthStat({ data, kind }) {
   const transactions = data?.transactions || []
+  const overrides = data?.categoryOverrides || {}
   const accountCurrencies = [...new Set((data?.accounts || []).map((account) => account.currencyCode).filter(Boolean))]
   const currency = accountCurrencies.includes('BRL') ? 'BRL' : accountCurrencies[0] || 'BRL'
   const currentMonth = currentFinanceMonth()
@@ -623,8 +624,8 @@ function MonthStat({ data, kind }) {
     const date = parseFinanceDate(tx.date)
     return !Number.isNaN(date.getTime()) && String(tx.date || '').slice(0, 7) === currentMonth && isPosted(tx) && (tx.currencyCode || 'BRL') === currency
   })
-  const exp = current.filter((tx) => isExpense(tx) && !isInternalTransfer(tx)).reduce((sum, tx) => sum + expenseValue(tx), 0)
-  const income = current.filter((tx) => !isExpense(tx) && tx._accountType !== 'CREDIT' && !isInternalTransfer(tx)).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0)
+  const exp = current.filter((tx) => isExpense(tx) && !isInternalTransfer(tx, overrides)).reduce((sum, tx) => sum + expenseValue(tx), 0)
+  const income = current.filter((tx) => !isExpense(tx) && tx._accountType !== 'CREDIT' && !isInternalTransfer(tx, overrides)).reduce((sum, tx) => sum + Math.abs(Number(tx.amount || 0)), 0)
   const cards = (data?.accounts || []).filter((account) => account.type === 'CREDIT' && (account.currencyCode || 'BRL') === currency)
   const cardBalance = cards.reduce((sum, account) => sum + Math.max(0, Number(account.balance || 0)), 0)
   const values = {
@@ -684,7 +685,7 @@ function isCommonTaxOrFee(transaction) {
   return /\b(?:iof|tax(?:a|as|es)?|fees?|tarifas?|tariff|encargos?|impostos?|tributos?|anuidade|service charge|maintenance fee|bank charge)\b/.test(label)
 }
 
-function isRecurringExternalTransfer(tx) {
+function isRecurringExternalTransfer(tx, overrides = {}) {
   const categoryId = String(tx.categoryId || '')
   const operationType = String(tx.operationType || '').toUpperCase()
   const merchant = typeof tx.merchant === 'string' ? tx.merchant : tx.merchant?.name || ''
@@ -693,7 +694,7 @@ function isRecurringExternalTransfer(tx) {
   const generalTransferPix = categoryId.startsWith('0500') && operationType === 'PIX'
   if ((!explicitlyPix && !generalTransferPix)
     || tx._accountType === 'CREDIT'
-    || isInternalTransfer(tx)
+    || isInternalTransfer(tx, overrides)
     || isBankSlipTransaction(tx)
     || operationType === 'CARTAO'
     || operationType === 'PAGAMENTO_FATURA'
@@ -714,7 +715,7 @@ function analyzeMonthlyPattern(transactions, overrides, displayAliases = {}) {
   for (const tx of transactions) {
     const date = parseFinanceDate(tx.date)
     if (Number.isNaN(date.getTime())) continue
-    const transferPattern = isRecurringExternalTransfer(tx)
+    const transferPattern = isRecurringExternalTransfer(tx, overrides)
     const taxFeePattern = !transferPattern && isCommonTaxOrFee(tx)
     const source = transferPattern ? recurringTransferSource(tx) : taxFeePattern ? 'Taxes & fees' : recurringSource(tx)
     const key = taxFeePattern ? 'common-taxes-and-fees' : normalizeRecurringSource(source)
@@ -844,7 +845,7 @@ function buildEverydaySpendPatterns(transactions, overrides, displayAliases = {}
   const groups = new Map()
   for (const transaction of transactions) {
     if (!isExpense(transaction)
-      || isInternalTransfer(transaction)
+      || isInternalTransfer(transaction, overrides)
       || String(transaction.categoryId || '').startsWith('05')
       || isBankSlipTransaction(transaction)) continue
     const category = transactionCategory(transaction, overrides)
@@ -979,18 +980,18 @@ function buildRecurringInsights(data, preferredCurrency = null) {
   const displayAliases = data?.displayAliases || {}
   const expenseRows = recent.filter((tx) => {
     const category = transactionCategory(tx, overrides).toLowerCase()
-    const ordinaryExpense = !isInternalTransfer(tx)
+    const ordinaryExpense = !isInternalTransfer(tx, overrides)
       && !String(tx.categoryId || '').startsWith('05')
       && !isBankSlipTransaction(tx)
     return isExpense(tx)
-      && (ordinaryExpense || isRecurringExternalTransfer(tx))
+      && (ordinaryExpense || isRecurringExternalTransfer(tx, overrides))
       && !category.includes('investment')
       && !category.includes('investimento')
       && !variableSpendCategoryPattern.test(category.normalize('NFD').replace(/[\u0300-\u036f]/g, ''))
   })
   const recurringRules = data?.recurringRules || {}
   const sourcePatterns = analyzeMonthlyPattern(expenseRows, overrides, displayAliases)
-    .filter((group) => group.monthCount >= 5 && (!group.transferPattern || group.rows.filter(isRecurringExternalTransfer).length >= 5))
+    .filter((group) => group.monthCount >= 5 && (!group.transferPattern || group.rows.filter((tx) => isRecurringExternalTransfer(tx, overrides)).length >= 5))
   const everydayPatterns = buildEverydaySpendPatterns(recent, overrides, displayAliases)
   const recurringExpenses = [...sourcePatterns, ...everydayPatterns]
     .map((group) => ({
@@ -1008,7 +1009,7 @@ function buildRecurringInsights(data, preferredCurrency = null) {
     return tx._accountType !== 'CREDIT'
       && !isExpense(tx)
       && Number(tx.amount) > 0
-      && !isInternalTransfer(tx)
+      && !isInternalTransfer(tx, overrides)
       && !String(tx.categoryId || '').startsWith('05')
       && !excludedIncomeWords.test(label)
   })
@@ -1824,6 +1825,7 @@ function InstallmentBillsDashboard({ data }) {
 
 function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
   const overrides = data?.categoryOverrides || {}
+  const displayAliases = data?.displayAliases || {}
   const currencies = [...new Set((data?.accounts || []).map((account) => account.currencyCode).filter(Boolean))]
   if (!currencies.length) currencies.push('BRL')
   const activeCurrency = currencies.includes(currency) ? currency : currencies.includes('BRL') ? 'BRL' : currencies[0]
@@ -1831,22 +1833,29 @@ function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
     const cutoff = new Date()
     cutoff.setDate(cutoff.getDate() - days)
     const totals = new Map()
+    const contributions = new Map()
     const patternByTransaction = new Map()
     for (const pattern of buildRecurringInsights(data, activeCurrency).recurringExpenses) {
       if (!pattern.categoryAllocations?.length) continue
       for (const transaction of pattern.rows) patternByTransaction.set(String(transaction.id), pattern)
     }
     for (const tx of data?.transactions || []) {
-      if (!isExpense(tx) || isInternalTransfer(tx) || !isPosted(tx) || parseFinanceDate(tx.date) < cutoff || (tx.currencyCode || 'BRL') !== activeCurrency) continue
+      if (!isExpense(tx) || isInternalTransfer(tx, overrides) || !isPosted(tx) || parseFinanceDate(tx.date) < cutoff || (tx.currencyCode || 'BRL') !== activeCurrency) continue
       const amount = expenseValue(tx)
       const category = transactionCategory(tx, overrides)
       const pattern = patternByTransaction.get(String(tx.id))
       const categoryAmounts = pattern ? allocatedCategoryAmounts(pattern, amount, category) : [{ category, amount }]
       for (const row of categoryAmounts) {
         totals.set(row.category, (totals.get(row.category) || 0) + row.amount)
+        if (!contributions.has(row.category)) contributions.set(row.category, [])
+        contributions.get(row.category).push({ transaction: tx, amount: row.amount })
       }
     }
-    return [...totals.entries()].map(([category, amount]) => ({ category, amount })).sort((a, b) => b.amount - a.amount).slice(0, 7)
+    return [...totals.entries()].map(([category, amount]) => ({
+      category,
+      amount,
+      contributions: contributions.get(category).sort((a, b) => b.amount - a.amount),
+    })).sort((a, b) => b.amount - a.amount).slice(0, 7)
   }, [data, days, overrides, activeCurrency])
   return (
     <div className="panel w-full min-w-0 rounded-[24px] bg-white p-5 shadow-soft md:p-6">
@@ -1865,6 +1874,16 @@ function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
           </BarChart>
         </ResponsiveContainer>
       </div> : <EmptyState icon={<ArrowDownLeft size={20} />} title="No expenses in this period" detail="When Pluggy syncs transactions, your spending categories will appear here." />}
+      {chartData.length > 0 && <details className="mt-4 rounded-xl border border-[#2d2537] p-3">
+        <summary className="cursor-pointer text-xs font-bold">See transactions behind these totals</summary>
+        <div className="mt-3 space-y-2">{chartData.map((row) => <details key={row.category} className="rounded-lg border border-[#2d2537] p-3">
+          <summary className="cursor-pointer text-xs font-semibold">{row.category} · {money(row.amount, activeCurrency)} · {row.contributions.length} transaction{row.contributions.length === 1 ? '' : 's'}</summary>
+          <div className="mt-2 max-h-64 divide-y divide-[#2d2537] overflow-y-auto">{row.contributions.map(({ transaction, amount }) => <div key={transaction.id} className="flex min-w-0 flex-wrap justify-between gap-x-3 gap-y-1 py-2 text-xs">
+            <div className="min-w-0"><p className="break-words font-semibold">{transaction.description || transaction.descriptionRaw || 'Transaction'}</p><p className="mt-0.5 break-words text-[10px] text-muted">{dateLabel(transaction.date, { month: 'short', day: 'numeric', year: 'numeric' })} · {transactionAccountLabel(transaction, displayAliases)}{Math.abs(amount - expenseValue(transaction)) > 0.01 ? ' · allocated share' : ''}</p></div>
+            <span className="shrink-0 font-bold">{money(amount, activeCurrency)}</span>
+          </div>)}</div>
+        </details>)}</div>
+      </details>}
       <div className="mt-1 flex items-center gap-2 text-[10px] text-muted"><span className="h-2 w-2 rounded-full bg-accent" /> Posted spending excluding own transfers and card payments · {activeCurrency}</div>
     </div>
   )
