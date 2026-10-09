@@ -7,6 +7,8 @@ import {
   ArrowUpRight,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CircleHelp,
   CreditCard,
   Filter,
@@ -80,6 +82,36 @@ const transactionCategory = (transaction, overrides) => overrides[transaction.id
 const isExpense = (transaction) => transaction.type === 'DEBIT' || (!transaction.type && Number(transaction.amount) < 0)
 const isPosted = (transaction) => !transaction.status || transaction.status === 'POSTED'
 const expenseValue = (transaction) => Math.abs(Number(transaction.amount || 0))
+function displayAlias(displayAliases, kind, id) {
+  return id == null ? '' : String(displayAliases?.[`${kind}:${id}`] || '').trim()
+}
+
+function displayAccountName(account, displayAliases = {}) {
+  const isCard = account?.type === 'CREDIT' || account?._accountType === 'CREDIT'
+  const id = account?.id ?? account?.accountId
+  return displayAlias(displayAliases, isCard ? 'card' : 'account', id)
+    || account?.name
+    || account?.marketingName
+    || (isCard ? 'Credit card' : 'Bank account')
+}
+
+function displayInstitutionName(itemId, fallback, displayAliases = {}) {
+  return displayAlias(displayAliases, 'institution', itemId) || fallback || 'Connected institution'
+}
+
+function displayInstitutionForAccount(account, displayAliases = {}) {
+  return displayInstitutionName(account?.itemId || account?._itemId, account?._institutionName || account?._itemName, displayAliases)
+}
+
+function transactionAccountLabel(transaction, displayAliases = {}) {
+  const type = transaction?._accountType === 'CREDIT' ? 'card' : 'account'
+  const accountId = transaction?.accountId || transaction?._accountId
+  const accountName = displayAlias(displayAliases, type, accountId) || transaction?._accountName || 'Account'
+  const itemId = transaction?._itemId || transaction?.itemId
+  const institutionName = displayAlias(displayAliases, 'institution', itemId) || transaction?._itemName
+  return institutionName ? `${accountName} · ${institutionName}` : accountName
+}
+
 const isInternalTransfer = (transaction) => {
   const categoryId = String(transaction.categoryId || '')
   const category = String(transaction.category || '').trim().toLowerCase()
@@ -95,10 +127,93 @@ const isInternalTransfer = (transaction) => {
 }
 const isBankSlipTransaction = (transaction) => String(transaction.categoryId || '').startsWith('0501')
   || String(transaction.category || '').trim().toLowerCase() === 'transfer - bank slip'
+const variableSpendCategoryPattern = /groceries|grocery|supermarket|mercado|mercearia|alimentacao|feira|hortifruti|sacolao|eating out|restaurant|dining|comer fora|lunch|restaurante|food delivery|delivery|ifood|rappi|uber eats|ubereats|food and drinks|shopping|compras|gas stations|fuel|gasoline|petrol|combustivel|posto|\bgas\b|diesel|vehicle maintenance|automotive|auto repair|clothing|vestuario|travel|viagem|entertainment|entretenimento|sports goods|hospital clinics|healthcare|pharmacy|farmacia|hospital|clinicas|personal care|beauty|pets|pet care|home goods|household|public transit|transportation|rideshare|ride share/i
+const foodDeliveryPattern = /\b(food delivery|delivery|ifood|rappi|uber[ ._-]*eats|ubereats|99[ ._-]*food|aiqfome|takeaway|takeout)\b/i
+const restaurantMealPattern = /restaurant|dining|eating out|comer fora|lunch|restaurante|refeicao|meal|food and drinks|food and drink|food & drinks|food & drink|restaurants? and bars|cafes?/i
+const weekdayLunchGroup = {
+  key: 'workday-lunches',
+  label: 'Workday lunches',
+  note: 'Restaurant purchases Monday–Friday from 11 a.m. to 3 p.m., using the time recorded by the institution.',
+}
+const foodDeliveryGroup = {
+  key: 'food-delivery',
+  label: 'Food delivery',
+  note: 'Grouped by delivery service names or delivery-related category and transaction text.',
+}
+const eatingOutGroup = {
+  key: 'eating-out',
+  label: 'Eating out',
+  note: 'Restaurant purchases outside the weekday lunch window, including evenings and weekends.',
+}
+const everydaySpendCategoryGroups = [
+  { key: 'groceries', label: 'Groceries', pattern: /grocery|supermarket|mercado|mercearia|alimentacao|feira|hortifruti|sacolao/ },
+  { key: 'restaurant-meals', label: 'Restaurant meals', pattern: restaurantMealPattern },
+  { key: 'food-delivery', label: 'Food delivery', pattern: /food delivery|delivery|ifood|rappi|uber eats|takeaway|takeout/ },
+  { key: 'fuel', label: 'Fuel & gas', pattern: /gas station|fuel|gasoline|petrol|combustivel|posto|gasolina|etanol|diesel|^gas$/ },
+  { key: 'vehicle-maintenance', label: 'Vehicle maintenance', pattern: /vehicle maintenance|automotive|auto repair|car repair|vehicle|manutencao veicular|oficina|mecanica|automotivo/ },
+  { key: 'clothing', label: 'Clothing', pattern: /clothing|vestuario|apparel/ },
+  { key: 'shopping', label: 'Shopping', pattern: /shopping|compras/ },
+  { key: 'travel', label: 'Travel', pattern: /travel|viagem/ },
+  { key: 'entertainment', label: 'Entertainment', pattern: /entertainment|entretenimento/ },
+  { key: 'healthcare', label: 'Healthcare', pattern: /hospital clinics|healthcare|pharmacy|farmacia|hospital|clinicas|clinica|saude/ },
+  { key: 'sports-goods', label: 'Sports & fitness', pattern: /sports goods|sports|fitness|esportes/ },
+  { key: 'personal-care', label: 'Personal care', pattern: /personal care|beauty|beleza|care products/ },
+  { key: 'pets', label: 'Pets', pattern: /pets|pet care|veterinary|veterinario/ },
+  { key: 'household', label: 'Household', pattern: /home goods|household|casa e jardim|casa/ },
+  { key: 'transportation', label: 'Transportation', pattern: /public transit|transportation|transporte|transit|rideshare|ride share/ },
+]
+
+function everydaySpendCategory(category) {
+  const normalized = String(category || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  const known = everydaySpendCategoryGroups.find((group) => group.pattern.test(normalized))
+  if (known) return known
+  if (!variableSpendCategoryPattern.test(normalized)) return null
+  const label = String(category || 'Other variable spending').trim()
+  const key = normalized.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'other-variable-spending'
+  return { key: `category-${key}`, label }
+}
+
+function transactionBusinessDay(transaction) {
+  const rawDate = String(transaction.date || '')
+  const dateParts = rawDate.match(/^(\d{4})-(\d{2})-(\d{2})/)?.slice(1).map(Number)
+  if (!dateParts) return false
+  const [year, month, day] = dateParts
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay()
+  return weekday >= 1 && weekday <= 5
+}
+
+function transactionRecordedHour(transaction) {
+  // Some linked-bank timestamps preserve the institution's local clock despite a UTC suffix.
+  // Reading the encoded clock avoids shifting lunchtime purchases by the UTC offset.
+  const hour = String(transaction.date || '').match(/[T ](\d{2}):\d{2}/)?.[1]
+  return hour === undefined ? null : Number(hour)
+}
+
+function classifyEverydaySpend(transaction, category) {
+  const normalizedText = [category, recurringSource(transaction), transaction.description, transaction.descriptionRaw]
+    .filter(Boolean)
+    .join(' ')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+  if (foodDeliveryPattern.test(normalizedText)) return foodDeliveryGroup
+
+  const categoryGroup = everydaySpendCategory(category)
+  if (categoryGroup?.key === 'groceries') return categoryGroup
+  const restaurantMeal = categoryGroup?.key === 'restaurant-meals' || restaurantMealPattern.test(normalizedText)
+  if (restaurantMeal) {
+    const hour = transactionRecordedHour(transaction)
+    return transactionBusinessDay(transaction) && hour !== null && hour >= 11 && hour < 15
+      ? weekdayLunchGroup
+      : eatingOutGroup
+  }
+  return categoryGroup
+}
 
 function App() {
   const [session, setSession] = useState(null)
   const autoSyncLock = useRef(false)
+  const appContentRef = useRef(null)
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -287,8 +402,8 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen w-full min-w-0 bg-paper text-ink">
-      <div className="mx-auto w-full min-w-0 max-w-[1480px] px-4 py-5 sm:px-5 md:px-9 md:py-8">
+    <div className="app-shell min-h-screen w-full min-w-0 bg-paper text-ink">
+      <div ref={appContentRef} className="app-content mx-auto w-full min-w-0 max-w-[1480px] px-4 py-5 sm:px-5 md:px-9 md:py-8">
         <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="brand-mark"><Landmark size={21} strokeWidth={2.1} /></div>
@@ -362,7 +477,16 @@ function App() {
         {activeTab === 'accounts' && <>
           <CreditAndSlipsDashboard data={data} />
           <InstallmentBillsDashboard data={data} />
-          <AccountsPanel data={data} onConnect={connect} connecting={connecting} onImportExisting={importExisting} onImportItemId={importItemId} importing={importing} />
+          <AccountsPanel data={data} onConnect={connect} connecting={connecting} onImportExisting={importExisting} onImportItemId={importItemId} importing={importing} onAliasSave={async (aliasKey, alias) => {
+            const saved = await api('/api/display-aliases', { method: 'PUT', body: JSON.stringify({ alias_key: aliasKey, alias }) })
+            setData((current) => {
+              const displayAliases = { ...(current?.displayAliases || {}) }
+              if (saved.alias) displayAliases[aliasKey] = saved.alias
+              else delete displayAliases[aliasKey]
+              return { ...current, displayAliases }
+            })
+            setMessage(saved.alias ? 'Display alias saved.' : 'Display alias cleared.')
+          }} />
         </>}
 
         <footer className="mt-7 flex flex-col justify-between gap-2 border-t border-[#e8ede9] py-5 pb-24 text-[11px] text-muted sm:flex-row sm:items-center">
@@ -376,7 +500,12 @@ function App() {
           { id: 'outlook', label: 'Outlook', icon: TrendingUp },
           { id: 'transactions', label: 'Transactions', icon: List },
           { id: 'accounts', label: 'Accounts', icon: Landmark },
-        ].map(({ id, label, icon: Icon }) => <button key={id} type="button" className={`bottom-nav-item ${activeTab === id ? 'bottom-nav-item-active' : ''}`} aria-current={activeTab === id ? 'page' : undefined} onClick={() => { setActiveTab(id); window.scrollTo({ top: 0, behavior: 'smooth' }) }}>
+        ].map(({ id, label, icon: Icon }) => <button key={id} type="button" className={`bottom-nav-item ${activeTab === id ? 'bottom-nav-item-active' : ''}`} aria-current={activeTab === id ? 'page' : undefined} onClick={() => {
+          setActiveTab(id)
+          const isMobileLayout = window.matchMedia('(max-width: 639px)').matches
+          if (isMobileLayout) appContentRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+          else window.scrollTo({ top: 0, behavior: 'smooth' })
+        }}>
           <Icon size={19} strokeWidth={activeTab === id ? 2.4 : 1.9} /><span>{label}</span>
         </button>)}
       </nav>
@@ -533,10 +662,8 @@ function recurringTransferSource(tx) {
   return (typeof merchant === 'string' ? merchant : merchant?.name || merchant?.businessName || merchant?.displayName) || describedRecipient
 }
 
-function recurringAccountLabel(transaction) {
-  const account = transaction._accountName || 'Account'
-  const institution = transaction._itemName
-  return institution ? `${account} · ${institution}` : account
+function recurringAccountLabel(transaction, displayAliases = {}) {
+  return transactionAccountLabel(transaction, displayAliases)
 }
 
 function isCommonTaxOrFee(transaction) {
@@ -567,7 +694,7 @@ function isRecurringExternalTransfer(tx) {
   return source.length >= 4 && !/^(pix|transferencia|transferencia enviada|transferencia recebida|pagamento)$/.test(source)
 }
 
-function analyzeMonthlyPattern(transactions, overrides) {
+function analyzeMonthlyPattern(transactions, overrides, displayAliases = {}) {
   const groups = new Map()
   const genericSources = /^(pix|pix recebido|pix enviado|transferencia|transferencia recebida|transferencia enviada|pagamento|compra|debito|credito|debit|credit)$/
 
@@ -624,29 +751,55 @@ function analyzeMonthlyPattern(transactions, overrides) {
     const variance = amounts.reduce((sum, amount) => sum + ((amount - mean) ** 2), 0) / Math.max(1, amounts.length)
     const categoryCounts = new Map()
     const categoryTotals = new Map()
+    const transactionCountsByMonth = new Map()
+    const sourceAccountsByMonth = new Map()
     for (const tx of rows) {
       const category = transactionCategory(tx, overrides)
       categoryCounts.set(category, (categoryCounts.get(category) || 0) + 1)
       categoryTotals.set(category, (categoryTotals.get(category) || 0) + Math.abs(Number(tx.amount || 0)))
     }
+    for (const tx of group.rows) {
+      const date = parseFinanceDate(tx.date)
+      const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+      transactionCountsByMonth.set(month, (transactionCountsByMonth.get(month) || 0) + 1)
+      if (!sourceAccountsByMonth.has(month)) sourceAccountsByMonth.set(month, new Set())
+      sourceAccountsByMonth.get(month).add(recurringAccountLabel(tx, displayAliases))
+    }
     const category = [...categoryCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 'Uncategorized'
     const categoryAmounts = [...categoryTotals.entries()]
       .map(([name, amount]) => ({ category: name, amount: amount / Math.max(1, monthKeys.length) }))
       .sort((a, b) => b.amount - a.amount)
-    const sourceAccounts = [...new Set(rows.map(recurringAccountLabel))].sort((a, b) => a.localeCompare(b))
+    const categoryAmountsByMonth = new Map()
+    for (const tx of group.rows) {
+      const date = parseFinanceDate(tx.date)
+      const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+      if (!categoryAmountsByMonth.has(month)) categoryAmountsByMonth.set(month, new Map())
+      const monthCategories = categoryAmountsByMonth.get(month)
+      const name = transactionCategory(tx, overrides)
+      monthCategories.set(name, (monthCategories.get(name) || 0) + Math.abs(Number(tx.amount || 0)))
+    }
+    const sourceAccounts = [...new Set(rows.map((tx) => recurringAccountLabel(tx, displayAliases)))].sort((a, b) => a.localeCompare(b))
     const taxFeeDetails = group.taxFeePattern
-      ? [...new Set(rows.map((tx) => recurringSource(tx)).filter(Boolean))].map((sourceName) => {
+      ? [...new Set(group.rows.map((tx) => recurringSource(tx)).filter(Boolean))].map((sourceName) => {
         const detailRows = rows.filter((tx) => recurringSource(tx) === sourceName)
+        const allDetailRows = group.rows.filter((tx) => recurringSource(tx) === sourceName)
         const monthlyTotals = new Map()
+        const allMonthlyTotals = new Map()
         for (const tx of detailRows) {
           const date = parseFinanceDate(tx.date)
           const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
           monthlyTotals.set(month, (monthlyTotals.get(month) || 0) + Math.abs(Number(tx.amount || 0)))
         }
+        for (const tx of allDetailRows) {
+          const date = parseFinanceDate(tx.date)
+          const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+          allMonthlyTotals.set(month, (allMonthlyTotals.get(month) || 0) + Math.abs(Number(tx.amount || 0)))
+        }
         return {
           source: sourceName,
           mean: [...monthlyTotals.values()].reduce((sum, amount) => sum + amount, 0) / Math.max(1, monthKeys.length),
-          accounts: [...new Set(detailRows.map(recurringAccountLabel))].sort((a, b) => a.localeCompare(b)),
+          monthlyAmounts: allMonthlyTotals,
+          accounts: [...new Set(allDetailRows.map((tx) => recurringAccountLabel(tx, displayAliases)))].sort((a, b) => a.localeCompare(b)),
         }
       }).sort((a, b) => b.mean - a.mean)
       : []
@@ -656,7 +809,9 @@ function analyzeMonthlyPattern(transactions, overrides) {
       rows,
       category,
       categoryAmounts,
+      categoryAmountsByMonth: new Map([...categoryAmountsByMonth.entries()].map(([month, totals]) => [month, [...totals.entries()].map(([name, amount]) => ({ category: name, amount })).sort((a, b) => b.amount - a.amount)])),
       sourceAccounts,
+      sourceAccountsByMonth: new Map([...sourceAccountsByMonth.entries()].map(([month, accounts]) => [month, [...accounts].sort((a, b) => a.localeCompare(b))])),
       taxFeeDetails,
       latestDate: latest?.date,
       monthKeys,
@@ -664,8 +819,128 @@ function analyzeMonthlyPattern(transactions, overrides) {
       mean,
       coefficientOfVariation: mean ? Math.sqrt(variance) / mean : 0,
       monthlyAmounts: new Map(monthKeys.map((month) => [month, group.months.get(month) || 0])),
+      allMonthlyAmounts: new Map(group.months),
+      allMonthlyCounts: transactionCountsByMonth,
       largestGap,
       isMonthly: monthKeys.length >= 3 && largestGap <= 2,
+    }
+  }).filter((group) => group.isMonthly)
+}
+
+function buildEverydaySpendPatterns(transactions, overrides, displayAliases = {}) {
+  const groups = new Map()
+  for (const transaction of transactions) {
+    if (!isExpense(transaction)
+      || isInternalTransfer(transaction)
+      || String(transaction.categoryId || '').startsWith('05')
+      || isBankSlipTransaction(transaction)) continue
+    const category = transactionCategory(transaction, overrides)
+    if (/investment|investimento/i.test(category)) continue
+    const categoryGroup = classifyEverydaySpend(transaction, category)
+    if (!categoryGroup) continue
+    const date = parseFinanceDate(transaction.date)
+    if (Number.isNaN(date.getTime())) continue
+    const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+    const key = `everyday-category:${categoryGroup.key}`
+    if (!groups.has(key)) groups.set(key, {
+      key,
+      source: categoryGroup.label,
+      category: categoryGroup.label,
+      classificationNote: categoryGroup.note || '',
+      rows: [],
+      months: new Map(),
+      monthlyCounts: new Map(),
+      monthlyAccounts: new Map(),
+      categories: new Map(),
+      categoryMonths: new Map(),
+      merchants: new Map(),
+    })
+    const group = groups.get(key)
+    const amount = expenseValue(transaction)
+    group.rows.push(transaction)
+    group.months.set(month, (group.months.get(month) || 0) + amount)
+    group.monthlyCounts.set(month, (group.monthlyCounts.get(month) || 0) + 1)
+    if (!group.monthlyAccounts.has(month)) group.monthlyAccounts.set(month, new Set())
+    group.monthlyAccounts.get(month).add(recurringAccountLabel(transaction, displayAliases))
+    const displayCategory = ['workday-lunches', 'food-delivery', 'eating-out'].includes(categoryGroup.key)
+      ? categoryGroup.label
+      : category
+    const categoryTotals = group.categories.get(displayCategory) || { total: 0, count: 0 }
+    categoryTotals.total += amount
+    categoryTotals.count += 1
+    group.categories.set(displayCategory, categoryTotals)
+    if (!group.categoryMonths.has(month)) group.categoryMonths.set(month, new Map())
+    const monthCategories = group.categoryMonths.get(month)
+    monthCategories.set(displayCategory, (monthCategories.get(displayCategory) || 0) + amount)
+    const merchant = recurringSource(transaction)
+    const merchantKey = normalizeRecurringSource(merchant) || 'unknown source'
+    if (!group.merchants.has(merchantKey)) group.merchants.set(merchantKey, {
+      source: merchant,
+      total: 0,
+      count: 0,
+      months: new Set(),
+      rows: [],
+      monthlyAmounts: new Map(),
+      monthlyCounts: new Map(),
+      monthlyAccounts: new Map(),
+    })
+    const merchantGroup = group.merchants.get(merchantKey)
+    merchantGroup.total += amount
+    merchantGroup.count += 1
+    merchantGroup.months.add(month)
+    merchantGroup.rows.push(transaction)
+    merchantGroup.monthlyAmounts.set(month, (merchantGroup.monthlyAmounts.get(month) || 0) + amount)
+    merchantGroup.monthlyCounts.set(month, (merchantGroup.monthlyCounts.get(month) || 0) + 1)
+    if (!merchantGroup.monthlyAccounts.has(month)) merchantGroup.monthlyAccounts.set(month, new Set())
+    merchantGroup.monthlyAccounts.get(month).add(recurringAccountLabel(transaction, displayAliases))
+  }
+
+  return [...groups.values()].map((group) => {
+    const monthKeys = [...group.months.keys()].sort()
+    const total = [...group.months.values()].reduce((sum, amount) => sum + amount, 0)
+    const sourceAccounts = [...new Set(group.rows.map((transaction) => recurringAccountLabel(transaction, displayAliases)))].sort((a, b) => a.localeCompare(b))
+    const categoryAmounts = [...group.categories.entries()]
+      .map(([category, values]) => ({ category, amount: values.total / 12 }))
+      .sort((a, b) => b.amount - a.amount)
+    const merchantDetails = [...group.merchants.values()]
+      .map((merchant) => ({
+        source: merchant.source,
+        mean: merchant.total / 12,
+        count: merchant.count,
+        months: merchant.months.size,
+        accounts: [...new Set(merchant.rows.map((transaction) => recurringAccountLabel(transaction, displayAliases)))].sort((a, b) => a.localeCompare(b)),
+        monthlyAmounts: merchant.monthlyAmounts,
+        monthlyCounts: merchant.monthlyCounts,
+        monthlyAccounts: merchant.monthlyAccounts,
+      }))
+      .sort((a, b) => b.mean - a.mean)
+    return {
+      ...group,
+      source: `${group.source} across merchants`,
+      rows: group.rows,
+      categoryAmounts,
+      categoryAmountsByMonth: new Map([...group.categoryMonths.entries()].map(([month, totals]) => [month, [...totals.entries()].map(([category, amount]) => ({ category, amount })).sort((a, b) => b.amount - a.amount)])),
+      sourceAccounts,
+      sourceAccountsByMonth: new Map([...group.monthlyAccounts.entries()].map(([month, accounts]) => [month, [...accounts].sort((a, b) => a.localeCompare(b))])),
+      merchantDetails,
+      merchantCount: group.merchants.size,
+      taxFeeDetails: [],
+      transferPattern: false,
+      taxFeePattern: false,
+      categoryPattern: true,
+      classificationNote: group.classificationNote,
+      latestDate: [...group.rows].sort((a, b) => parseFinanceDate(b.date) - parseFinanceDate(a.date))[0]?.date,
+      monthKeys,
+      monthCount: monthKeys.length,
+      mean: total / 12,
+      coefficientOfVariation: 0,
+      monthlyAmounts: new Map(monthKeys.map((month) => [month, group.months.get(month) || 0])),
+      allMonthlyAmounts: new Map(group.months),
+      allMonthlyCounts: new Map(group.monthlyCounts),
+      largestGap: 0,
+      isMonthly: group.key === 'everyday-category:workday-lunches'
+        ? monthKeys.length >= 2 && group.rows.length >= 3
+        : monthKeys.length >= 5,
     }
   }).filter((group) => group.isMonthly)
 }
@@ -688,7 +963,7 @@ function buildRecurringInsights(data, preferredCurrency = null) {
       && (tx.currencyCode || 'BRL') === currency
   })
   const overrides = data?.categoryOverrides || {}
-  const variableSpendCategory = /groceries|eating out|shopping|food delivery|gas stations|vehicle maintenance|automotive|clothing|travel|entertainment|sports goods|hospital clinics/i
+  const displayAliases = data?.displayAliases || {}
   const expenseRows = recent.filter((tx) => {
     const category = transactionCategory(tx, overrides).toLowerCase()
     const ordinaryExpense = !isInternalTransfer(tx)
@@ -698,11 +973,13 @@ function buildRecurringInsights(data, preferredCurrency = null) {
       && (ordinaryExpense || isRecurringExternalTransfer(tx))
       && !category.includes('investment')
       && !category.includes('investimento')
-      && !variableSpendCategory.test(category)
+      && !variableSpendCategoryPattern.test(category.normalize('NFD').replace(/[\u0300-\u036f]/g, ''))
   })
   const recurringRules = data?.recurringRules || {}
-  const recurringExpenses = analyzeMonthlyPattern(expenseRows, overrides)
+  const sourcePatterns = analyzeMonthlyPattern(expenseRows, overrides, displayAliases)
     .filter((group) => group.monthCount >= 5 && (!group.transferPattern || group.rows.filter(isRecurringExternalTransfer).length >= 5))
+  const everydayPatterns = buildEverydaySpendPatterns(recent, overrides, displayAliases)
+  const recurringExpenses = [...sourcePatterns, ...everydayPatterns]
     .map((group) => ({
       ...group,
       alias: recurringRules[group.key]?.alias || '',
@@ -722,15 +999,17 @@ function buildRecurringInsights(data, preferredCurrency = null) {
       && !String(tx.categoryId || '').startsWith('05')
       && !excludedIncomeWords.test(label)
   })
-  const recurringIncome = analyzeMonthlyPattern(incomeRows, overrides)
+  const recurringIncome = analyzeMonthlyPattern(incomeRows, overrides, displayAliases)
     .filter((group) => group.monthCount >= 3 && group.coefficientOfVariation <= 0.3)
   const explicitSalary = recurringIncome.filter((group) => salaryWords.test(`${group.source} ${group.category}`))
   const salaryGroups = explicitSalary.length
     ? explicitSalary
     : recurringIncome.filter((group) => group.monthCount >= 4).sort((a, b) => b.mean - a.mean).slice(0, 1)
   const salaryByMonth = new Map()
+  const salaryRecordedByMonth = new Map()
   for (const group of salaryGroups) {
     for (const [month, amount] of group.monthlyAmounts) salaryByMonth.set(month, (salaryByMonth.get(month) || 0) + amount)
+    for (const [month, amount] of (group.allMonthlyAmounts || group.monthlyAmounts)) salaryRecordedByMonth.set(month, (salaryRecordedByMonth.get(month) || 0) + amount)
   }
   const salaryMonths = [...salaryByMonth.values()]
   const salaryMean = salaryMonths.length ? salaryMonths.reduce((sum, amount) => sum + amount, 0) / salaryMonths.length : null
@@ -740,6 +1019,8 @@ function buildRecurringInsights(data, preferredCurrency = null) {
     currency,
     recurringExpenses,
     recurringExpenseMean,
+    salaryMonthlyAmounts: salaryByMonth,
+    salaryRecordedByMonth,
     salary: salaryMean === null ? null : {
       mean: salaryMean,
       months: salaryMonths.length,
@@ -757,15 +1038,32 @@ function RecurringDashboard({ data, onRuleSave }) {
   const [savingKey, setSavingKey] = useState(null)
   const [ruleError, setRuleError] = useState('')
   const [expenseSort, setExpenseSort] = useState('amount')
+  const [outlookMode, setOutlookMode] = useState('average')
+  const [selectedOutlookMonth, setSelectedOutlookMonth] = useState(() => currentFinanceMonth())
   const insights = useMemo(() => buildRecurringInsights(data), [data])
-  const { currency, recurringExpenses, recurringExpenseMean, salary } = insights
+  const { currency, recurringExpenses, recurringExpenseMean, salary, salaryRecordedByMonth } = insights
+  const monthOptions = recentOutlookMonthOptions()
+  const selectedMonth = monthOptions.includes(selectedOutlookMonth) ? selectedOutlookMonth : monthOptions[0]
+  const selectedMonthIndex = monthOptions.indexOf(selectedMonth)
+  const selectedMonthCaption = `${outlookMonthLabel(selectedMonth)}${selectedMonth === monthOptions[0] ? ' to date' : ''}`
+  const monthlySalaryDetected = salaryRecordedByMonth.has(selectedMonth)
+  const monthlySalary = monthlySalaryDetected ? salaryRecordedByMonth.get(selectedMonth) : null
+  const displayedExpenseAmount = (expense) => outlookMode === 'month' ? monthlyExpenseAmount(expense, selectedMonth) : expense.mean
+  const displayedExpenseTotal = outlookMode === 'month'
+    ? recurringExpenses.filter((expense) => !expense.excluded).reduce((sum, expense) => sum + monthlyExpenseAmount(expense, selectedMonth), 0)
+    : recurringExpenseMean
+  const remainder = outlookMode === 'month'
+    ? monthlySalaryDetected ? monthlySalary - displayedExpenseTotal : null
+    : salary ? salary.mean - recurringExpenseMean : null
   const recurringRules = data?.recurringRules || {}
   const categorySuggestions = useMemo(() => [...new Set([
     ...(data?.transactions || []).map((transaction) => transactionCategory(transaction, data?.categoryOverrides || {})),
     ...Object.values(recurringRules).flatMap((rule) => (rule.categoryAllocations || []).map((allocation) => allocation.category)),
   ].map((category) => String(category || '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b)), [data, recurringRules])
-  const activeExpenses = recurringExpenses.filter((expense) => !expense.excluded)
-  const excludedExpenses = recurringExpenses.filter((expense) => expense.excluded)
+  const monthHasSpending = (expense) => outlookMode !== 'month' || monthlyExpenseAmount(expense, selectedMonth) > 0
+  const activeExpenses = recurringExpenses.filter((expense) => !expense.excluded && monthHasSpending(expense))
+  const excludedExpenses = recurringExpenses.filter((expense) => expense.excluded && monthHasSpending(expense))
+  const expensesInView = [...activeExpenses, ...excludedExpenses]
   const sortExpenseRows = (expenses) => [...expenses].sort((a, b) => {
     if (expenseSort === 'category') {
       const categoryLabel = (expense) => (expense.categoryAllocations.length ? expense.categoryAllocations : expense.categoryAmounts)
@@ -773,11 +1071,10 @@ function RecurringDashboard({ data, onRuleSave }) {
         .join(' · ') || expense.category
       return categoryLabel(a).localeCompare(categoryLabel(b)) || (b.mean - a.mean)
     }
-    return b.mean - a.mean
+    return displayedExpenseAmount(b) - displayedExpenseAmount(a)
   })
   const sortedActiveExpenses = sortExpenseRows(activeExpenses)
   const sortedExcludedExpenses = sortExpenseRows(excludedExpenses)
-  const remainder = salary ? salary.mean - recurringExpenseMean : null
   const persistRule = async (expense, changes) => {
     const current = recurringRules[expense.key] || {}
     const next = {
@@ -800,19 +1097,53 @@ function RecurringDashboard({ data, onRuleSave }) {
   const renderExpense = (expense) => {
     const rule = recurringRules[expense.key] || {}
     const editing = editingKey === expense.key
-    const allocationsToShow = expense.categoryAllocations.length ? expense.categoryAllocations : expense.categoryAmounts
+    const monthAmount = monthlyExpenseAmount(expense, selectedMonth)
+    const scaledAllocations = expense.categoryAllocations.length && expense.mean > 0
+      ? expense.categoryAllocations.map((allocation) => ({ ...allocation, amount: Number(allocation.amount) * monthAmount / expense.mean }))
+      : null
+    const monthCategoryAmounts = expense.categoryAmountsByMonth?.get(selectedMonth) || []
+    const allocationsToShow = outlookMode === 'month'
+      ? scaledAllocations || monthCategoryAmounts
+      : expense.categoryAllocations.length ? expense.categoryAllocations : expense.categoryAmounts
     const categorySummary = allocationsToShow.map((allocation) => `${allocation.category}: ${money(allocation.amount, currency)}`).join(' · ')
+    const transactionCount = expense.allMonthlyCounts?.get(selectedMonth) || 0
+    const sourceAccountsToShow = outlookMode === 'month'
+      ? expense.sourceAccountsByMonth?.get(selectedMonth) || []
+      : expense.sourceAccounts
+    const activitySummary = outlookMode === 'month'
+      ? `${transactionCount} transaction${transactionCount === 1 ? '' : 's'} in ${selectedMonthCaption}`
+      : `seen in ${expense.monthCount} months${expense.transferPattern ? ' · outgoing transfer' : expense.categoryPattern ? ` · ${expense.rows.length} purchases` : ''}`
+    const merchantDetails = expense.categoryPattern
+      ? expense.merchantDetails.map((merchant) => ({
+        ...merchant,
+        displayedAmount: outlookMode === 'month' ? Number(merchant.monthlyAmounts.get(selectedMonth) || 0) : merchant.mean,
+        displayedCount: outlookMode === 'month' ? Number(merchant.monthlyCounts.get(selectedMonth) || 0) : merchant.count,
+        displayedMonths: outlookMode === 'month' ? 0 : merchant.months,
+        displayedAccounts: outlookMode === 'month'
+          ? [...(merchant.monthlyAccounts.get(selectedMonth) || [])]
+          : merchant.accounts,
+      })).filter((merchant) => outlookMode !== 'month' || merchant.displayedAmount > 0)
+      : []
+    const taxFeeDetails = expense.taxFeeDetails?.filter((detail) => outlookMode !== 'month' || Number(detail.monthlyAmounts.get(selectedMonth) || 0) > 0) || []
     return <div key={expense.key} className={`recurring-pattern-row grid min-w-0 grid-cols-[minmax(0,1fr)_44px] gap-x-3 gap-y-3 py-4 sm:grid-cols-[minmax(0,1fr)_minmax(160px,220px)_44px] sm:items-center ${expense.excluded ? 'opacity-65' : ''}`}>
       <div className="col-span-2 flex min-w-0 items-start gap-3 sm:col-span-1">
         <span className="movement-icon movement-expense"><ArrowDownRight size={16} /></span>
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 flex-wrap items-center gap-2"><p className="min-w-0 truncate text-xs font-bold" title={expense.alias || expense.source}>{expense.alias || expense.source}</p>{expense.excluded && <span className="rounded-full bg-[#fafcfb] px-2 py-0.5 text-[10px] font-bold text-muted">Excluded</span>}</div>
-          <p className="mt-0.5 truncate text-[10px] text-muted" title={categorySummary}>{categorySummary || expense.category} · seen in {expense.monthCount} months{expense.transferPattern ? ' · outgoing transfer' : ''}</p>
-          <p className="mt-1 break-words text-[10px] text-muted">Source account{expense.sourceAccounts.length === 1 ? '' : 's'}: {expense.sourceAccounts.join(' · ')}</p>
-          {expense.taxFeePattern && <details className="mt-2 rounded-lg border border-[#2d2537] px-2.5 py-2 text-[10px]">
-            <summary className="cursor-pointer font-semibold">Tax and fee details ({expense.taxFeeDetails.length})</summary>
-            <ul className="mt-2 space-y-2">{expense.taxFeeDetails.map((detail) => <li key={detail.source} className="min-w-0">
-              <div className="flex min-w-0 flex-wrap justify-between gap-x-3"><span className="break-words">{detail.source}</span><span className="shrink-0 font-semibold">{money(detail.mean, currency)} / month</span></div>
+          <div className="flex min-w-0 flex-wrap items-center gap-2"><p className="min-w-0 truncate text-xs font-bold" title={expense.alias || expense.source}>{expense.alias || expense.source}</p>{expense.categoryPattern && <span className="rounded-full bg-[#292039] px-2 py-0.5 text-[10px] font-bold text-violet-200">Across merchants</span>}{expense.excluded && <span className="rounded-full bg-[#fafcfb] px-2 py-0.5 text-[10px] font-bold text-muted">Excluded</span>}</div>
+          <p className="mt-0.5 truncate text-[10px] text-muted" title={categorySummary}>{categorySummary || expense.category} · {activitySummary}</p>
+          {expense.classificationNote && <p className="mt-1 break-words text-[10px] text-muted">{expense.classificationNote}</p>}
+          <p className="mt-1 break-words text-[10px] text-muted">Source account{sourceAccountsToShow.length === 1 ? '' : 's'}: {sourceAccountsToShow.join(' · ') || 'No activity this month'}</p>
+          {expense.categoryPattern && merchantDetails.length > 0 && <details className="mt-2 max-w-2xl rounded-lg border border-[#2d2537] px-2.5 py-2 text-[10px]">
+            <summary className="cursor-pointer font-semibold">Merchant details ({merchantDetails.length})</summary>
+            <ul className="mt-2 max-h-48 space-y-2 overflow-y-auto pr-1">{merchantDetails.map((merchant) => <li key={merchant.source} className="min-w-0">
+              <div className="flex min-w-0 flex-wrap justify-between gap-x-3"><span className="break-words">{merchant.source} · {merchant.displayedCount} purchase{merchant.displayedCount === 1 ? '' : 's'}{outlookMode === 'month' ? '' : ` · ${merchant.displayedMonths} months`}</span><span className="shrink-0 font-semibold">{money(merchant.displayedAmount, currency)}{outlookMode === 'month' ? '' : ' / month'}</span></div>
+              <p className="mt-0.5 break-words text-muted">Source account{merchant.displayedAccounts.length === 1 ? '' : 's'}: {merchant.displayedAccounts.join(' · ')}</p>
+            </li>)}</ul>
+          </details>}
+          {expense.taxFeePattern && taxFeeDetails.length > 0 && <details className="mt-2 rounded-lg border border-[#2d2537] px-2.5 py-2 text-[10px]">
+            <summary className="cursor-pointer font-semibold">Tax and fee details ({taxFeeDetails.length})</summary>
+            <ul className="mt-2 space-y-2">{taxFeeDetails.map((detail) => <li key={detail.source} className="min-w-0">
+              <div className="flex min-w-0 flex-wrap justify-between gap-x-3"><span className="break-words">{detail.source}</span><span className="shrink-0 font-semibold">{money(outlookMode === 'month' ? Number(detail.monthlyAmounts.get(selectedMonth) || 0) : detail.mean, currency)}{outlookMode === 'month' ? '' : ' / month'}</span></div>
               <p className="mt-0.5 break-words text-muted">Source account{detail.accounts.length === 1 ? '' : 's'}: {detail.accounts.join(' · ')}</p>
             </li>)}</ul>
           </details>}
@@ -839,7 +1170,7 @@ function RecurringDashboard({ data, onRuleSave }) {
           </form>}
         </div>
       </div>
-      <div className="min-w-0 self-center text-left sm:text-right"><p className="text-sm font-extrabold">{money(expense.mean, currency)}</p><p className="text-[10px] text-muted">average / month</p></div>
+      <div className="min-w-0 self-center text-left sm:text-right"><p className="text-sm font-extrabold">{money(displayedExpenseAmount(expense), currency)}</p><p className="text-[10px] text-muted">{outlookMode === 'month' ? selectedMonthCaption : 'average / month'}</p></div>
       <details className="recurring-more-menu">
         <summary aria-label={`More actions for ${expense.alias || expense.source}`} title="More actions"><MoreVertical size={20} /></summary>
         <div className="recurring-more-options" role="group" aria-label="Recurring pattern actions">
@@ -857,45 +1188,59 @@ function RecurringDashboard({ data, onRuleSave }) {
         <div>
           <p className="eyebrow">Recurring patterns · last 12 months</p>
           <h2 className="section-title mt-1">Monthly outlook</h2>
-          <p className="mt-1 text-xs text-muted">Recurring charges and outgoing PIX patterns from the last 12 months. Aliases, category amounts, and exclusions persist across syncs.</p>
+          <p className="mt-1 text-xs text-muted">{outlookMode === 'month'
+            ? `Showing detected posted spending for ${selectedMonthCaption}. Credit card purchases count; card bill payments are excluded to prevent double counting.`
+            : 'Recurring charges and outgoing PIX, plus everyday spending grouped across merchants from the last 12 months. Credit card purchases count; card bill payments are excluded to prevent double counting.'}</p>
+          <p className="mt-1 text-[10px] text-muted">Weekday restaurant charges recorded from 11 a.m. to 3 p.m. are grouped as workday lunches, across merchants. Delivery is separated by service or transaction wording; other restaurant times appear as eating out.</p>
         </div>
-        <span className="rounded-full border border-[#edf1ee] bg-[#fafcfb] px-3 py-1.5 text-[10px] font-bold text-muted">{currency}</span>
+        <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
+          <div className="inline-flex rounded-xl border border-[#edf1ee] bg-[#fafcfb] p-1" role="group" aria-label="Monthly outlook view">
+            <button type="button" className={`rounded-lg px-3 py-2 text-[11px] font-bold transition ${outlookMode === 'average' ? 'bg-[#292039] text-white' : 'text-muted'}`} aria-pressed={outlookMode === 'average'} onClick={() => setOutlookMode('average')}>Averages</button>
+            <button type="button" className={`rounded-lg px-3 py-2 text-[11px] font-bold transition ${outlookMode === 'month' ? 'bg-[#292039] text-white' : 'text-muted'}`} aria-pressed={outlookMode === 'month'} onClick={() => setOutlookMode('month')}>By month</button>
+          </div>
+          {outlookMode === 'month' && <div className="flex items-center gap-1 rounded-xl border border-[#edf1ee] bg-[#fafcfb] p-1">
+            <button type="button" className="icon-button h-9 w-9" aria-label="Previous month" title="Previous month" disabled={selectedMonthIndex >= monthOptions.length - 1} onClick={() => setSelectedOutlookMonth(monthOptions[selectedMonthIndex + 1] || selectedMonth)}><ChevronLeft size={17} /></button>
+            <span className="min-w-[118px] text-center text-xs font-bold" aria-live="polite">{outlookMonthLabel(selectedMonth)}</span>
+            <button type="button" className="icon-button h-9 w-9" aria-label="Next month" title="Next month" disabled={selectedMonthIndex <= 0} onClick={() => setSelectedOutlookMonth(monthOptions[selectedMonthIndex - 1] || selectedMonth)}><ChevronRight size={17} /></button>
+          </div>}
+          <span className="rounded-full border border-[#edf1ee] bg-[#fafcfb] px-3 py-2 text-[10px] font-bold text-muted">{currency}</span>
+        </div>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-3">
         <div className="rounded-2xl border border-[#edf1ee] bg-[#fafcfb] p-4">
-          <div className="flex items-center gap-2 text-xs font-semibold text-muted"><span className="stat-icon stat-green"><ArrowUpRight size={16} /></span>Mean monthly salary</div>
-          <p className="mt-3 font-display text-2xl font-extrabold">{salary ? money(salary.mean, currency) : 'Not detected'}</p>
-          <p className="mt-1 truncate text-[10px] text-muted" title={salary?.source || ''}>{salary ? `${salary.explicitlyLabeled ? 'Salary' : 'Likely'}: ${salary.source} · ${salary.months} pay months` : 'Need at least 3 regular deposits'}</p>
+          <div className="flex items-center gap-2 text-xs font-semibold text-muted"><span className="stat-icon stat-green"><ArrowUpRight size={16} /></span>{outlookMode === 'month' ? `Detected salary · ${selectedMonthCaption}` : 'Mean monthly salary'}</div>
+          <p className="mt-3 font-display text-2xl font-extrabold">{outlookMode === 'month' ? monthlySalaryDetected ? money(monthlySalary, currency) : 'Not detected' : salary ? money(salary.mean, currency) : 'Not detected'}</p>
+          <p className="mt-1 truncate text-[10px] text-muted" title={salary?.source || ''}>{outlookMode === 'month' ? monthlySalaryDetected ? `Recognized source: ${salary?.source || 'Recurring deposit'}` : 'No recognized salary deposit in this month' : salary ? `${salary.explicitlyLabeled ? 'Salary' : 'Likely'}: ${salary.source} · ${salary.months} pay months` : 'Need at least 3 regular deposits'}</p>
         </div>
         <div className="rounded-2xl border border-[#edf1ee] bg-[#fafcfb] p-4">
-          <div className="flex items-center gap-2 text-xs font-semibold text-muted"><span className="stat-icon stat-rose"><RefreshCw size={15} /></span>Recurring expenses / month</div>
-          <p className="mt-3 font-display text-2xl font-extrabold">{money(recurringExpenseMean, currency)}</p>
-          <p className="mt-1 text-[10px] text-muted">{recurringExpenses.filter((expense) => !expense.excluded).length} active · {recurringExpenses.filter((expense) => expense.excluded).length} excluded patterns</p>
+          <div className="flex items-center gap-2 text-xs font-semibold text-muted"><span className="stat-icon stat-rose"><RefreshCw size={15} /></span>{outlookMode === 'month' ? `Detected spending · ${selectedMonthCaption}` : 'Recurring & everyday / month'}</div>
+          <p className="mt-3 font-display text-2xl font-extrabold">{money(displayedExpenseTotal, currency)}</p>
+          <p className="mt-1 text-[10px] text-muted">{outlookMode === 'month' ? `${activeExpenses.length} active patterns · ${excludedExpenses.length} excluded` : `${recurringExpenses.filter((expense) => !expense.excluded).length} active · ${recurringExpenses.filter((expense) => expense.excluded).length} excluded patterns`}</p>
         </div>
         <div className="rounded-2xl border border-[#edf1ee] bg-[#fafcfb] p-4">
-          <div className="flex items-center gap-2 text-xs font-semibold text-muted"><span className="stat-icon stat-violet"><Wallet size={15} /></span>Salary after recurring expenses</div>
+          <div className="flex items-center gap-2 text-xs font-semibold text-muted"><span className="stat-icon stat-violet"><Wallet size={15} /></span>{outlookMode === 'month' ? 'Salary after spending' : 'Salary after detected spending'}</div>
           <p className={`mt-3 font-display text-2xl font-extrabold ${remainder !== null && remainder < 0 ? 'text-rose-600' : ''}`}>{remainder === null ? '—' : money(remainder, currency)}</p>
-          <p className="mt-1 text-[10px] text-muted">Before variable spending and savings</p>
+          <p className="mt-1 text-[10px] text-muted">{outlookMode === 'month' ? monthlySalaryDetected ? `For ${selectedMonthCaption}; detected patterns only` : 'No recognized salary deposit for this month' : 'After recurring bills and regular category spending'}</p>
         </div>
       </div>
 
       <div className="mt-6">
         <div className="mb-2 flex flex-wrap items-end justify-between gap-3">
-          <div><h3 className="text-sm font-extrabold">Detected recurring expenses</h3><p className="mt-1 text-[10px] text-muted">Average per month with a matching charge; patterns need at least 5 months.</p></div>
+          <div><h3 className="text-sm font-extrabold">{outlookMode === 'month' ? `Spending in ${selectedMonthCaption}` : 'Recurring and everyday spending'}</h3><p className="mt-1 text-[10px] text-muted">{outlookMode === 'month' ? 'Amounts and category splits show posted transactions for this month only.' : 'Regular patterns need activity in at least 5 months; workday lunches appear after 3 weekday lunch-time purchases across 2 months. Source averages use active months; category averages use the full 12-month window. Choose By month for actual posted totals.'}</p></div>
           <label className="flex items-center gap-2 text-xs font-semibold text-muted">Sort by <select className="period-select" aria-label="Sort recurring expenses" value={expenseSort} onChange={(event) => setExpenseSort(event.target.value)}><option value="amount">Monthly amount</option><option value="category">Category</option></select></label>
         </div>
-        {recurringExpenses.length ? <>
+        {expensesInView.length ? <>
           <datalist id="recurring-category-suggestions">{categorySuggestions.map((category) => <option key={category} value={category} />)}</datalist>
           {activeExpenses.length > 0 && <div className="divide-y divide-[#edf1ee]">{sortedActiveExpenses.map(renderExpense)}</div>}
           {excludedExpenses.length > 0 && <details className="mt-4 rounded-xl border border-[#2d2537] bg-[#17131e] p-3">
             <summary className="cursor-pointer text-xs font-bold">Excluded expenses ({excludedExpenses.length})</summary>
             <div className="mt-2 divide-y divide-[#2d2537]">{sortedExcludedExpenses.map(renderExpense)}</div>
           </details>}
-        </> : <EmptyState icon={<RefreshCw size={19} />} title="No recurring expenses detected" detail="More repeated monthly transactions will make patterns easier to identify." />}
+        </> : <EmptyState icon={<RefreshCw size={19} />} title={outlookMode === 'month' ? `No detected spending in ${selectedMonthCaption}` : 'No recurring spending patterns detected'} detail={outlookMode === 'month' ? 'Use the month arrows to review another month.' : 'More repeated monthly transactions will make patterns easier to identify.'} />}
         {ruleError && <p className="mt-3 text-xs text-rose-600" role="alert">{ruleError}</p>}
       </div>
-      <p className="mt-4 border-t border-[#edf1ee] pt-3 text-[10px] leading-relaxed text-muted">Own-account transfers, card payments, bank slips, investments, and everyday variable purchases are excluded. Outgoing PIX transfers count only when the same recipient pattern appears in at least 5 months; recipient names are not hard-coded. Salary is inferred from regular bank deposits unless explicitly labeled.</p>
+      <p className="mt-4 border-t border-[#edf1ee] pt-3 text-[10px] leading-relaxed text-muted">Posted credit card purchases and bank account spending count. Card bill settlements, own-account transfers, bank slips, and investments are excluded to avoid double counting. Everyday categories are grouped across merchants; most require activity in 5 months, while workday lunches appear after 3 weekday lunch-time purchases across 2 months. {outlookMode === 'month' ? 'Monthly view shows activity for the selected month.' : 'Category averages use the 12-month window.'} Workday lunch classification uses the transaction timestamp. Outgoing PIX counts only when the same recipient pattern appears in at least 5 months. Salary is inferred from regular bank deposits unless explicitly labeled.</p>
     </section>
   )
 }
@@ -907,6 +1252,7 @@ function formatCurrencyTotals(totals) {
 
 function CreditAndSlipsDashboard({ data }) {
   const accounts = data?.accounts || []
+  const displayAliases = data?.displayAliases || {}
   const transactions = data?.transactions || []
   const bills = data?.bills || []
   const creditAccounts = accounts.filter((account) => account.type === 'CREDIT')
@@ -961,7 +1307,7 @@ function CreditAndSlipsDashboard({ data }) {
   const slipsByAccount = new Map()
   for (const slip of slips) {
     const account = bankAccountsById.get(String(slip.accountId))
-    const name = account?.name || slip._accountName || 'Bank account'
+    const name = account ? displayAccountName(account, displayAliases) : slip._accountName || 'Bank account'
     const currency = slip.currencyCode || account?.currencyCode || 'BRL'
     const amount = expenseValue(slip)
     slipTotals.set(currency, (slipTotals.get(currency) || 0) + amount)
@@ -1018,7 +1364,7 @@ function CreditAndSlipsDashboard({ data }) {
               const limit = credit.creditLimit == null ? null : Number(credit.creditLimit)
               const available = credit.availableCreditLimit == null ? null : Number(credit.availableCreditLimit)
               return <div key={account.id} className="py-3 first:pt-1 last:pb-1">
-                <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-xs font-bold">{account.name || account.marketingName || 'Credit card'}</p><p className="mt-0.5 truncate text-[10px] text-muted">{account._institutionName || account._itemName || 'Connected institution'}{account.number ? ` · ${account.number}` : ''}</p></div><p className="shrink-0 text-xs font-extrabold">{money(Math.abs(Number(account.balance || 0)), currency)}</p></div>
+                <div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-xs font-bold">{displayAccountName(account, displayAliases)}</p><p className="mt-0.5 truncate text-[10px] text-muted">{displayInstitutionForAccount(account, displayAliases)}{account.number ? ` · ${account.number}` : ''}</p></div><p className="shrink-0 text-xs font-extrabold">{money(Math.abs(Number(account.balance || 0)), currency)}</p></div>
           <div className="mt-2 grid min-w-0 grid-cols-2 gap-2 text-[10px] sm:grid-cols-3"><div className="min-w-0"><p className="text-muted">Total limit</p><p className="mt-0.5 font-bold">{limit == null || !Number.isFinite(limit) ? 'Not reported' : money(limit, currency)}</p></div><div className="min-w-0"><p className="text-muted">Available</p><p className="mt-0.5 font-bold">{available == null || !Number.isFinite(available) ? 'Not reported' : money(available, currency)}</p></div><div className="min-w-0"><p className="text-muted">Next invoice</p><p className="mt-0.5 font-bold">{nextBill ? money(nextBill.totalAmount, nextBill.totalAmountCurrencyCode || currency) : 'Not reported'}</p><p className="text-muted">{nextBill ? `Due ${dateLabel(nextBill.dueDate, { month: 'short', day: 'numeric' })}` : 'No upcoming invoice'}</p></div></div>
               </div>
             })}
@@ -1032,7 +1378,7 @@ function CreditAndSlipsDashboard({ data }) {
           </div> : <p className="py-2 text-xs text-muted">No paid bank slips reported in the last 12 months.</p>}
           {slips.length > 0 && <details className="border-t border-[#edf1ee] pt-2 text-[10px] text-muted">
             <summary className="cursor-pointer font-semibold">Recent bank slips</summary>
-            <div className="mt-2 space-y-2">{slips.slice(0, 6).map((slip) => <div key={slip.id} className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="truncate font-semibold text-ink">{slip.description || slip.descriptionRaw || 'Bank slip'}</p><p className="mt-0.5 truncate">{dateLabel(slip.date, { month: 'short', day: 'numeric', year: 'numeric' })} · {bankAccountsById.get(String(slip.accountId))?.name || slip._accountName || 'Bank account'}</p></div><p className="shrink-0 font-bold text-ink">{money(expenseValue(slip), slip.currencyCode || 'BRL')}</p></div>)}</div>
+            <div className="mt-2 space-y-2">{slips.slice(0, 6).map((slip) => { const account = bankAccountsById.get(String(slip.accountId)); return <div key={slip.id} className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="truncate font-semibold text-ink">{slip.description || slip.descriptionRaw || 'Bank slip'}</p><p className="mt-0.5 truncate">{dateLabel(slip.date, { month: 'short', day: 'numeric', year: 'numeric' })} · {account ? displayAccountName(account, displayAliases) : slip._accountName || 'Bank account'}</p></div><p className="shrink-0 font-bold text-ink">{money(expenseValue(slip), slip.currencyCode || 'BRL')}</p></div>})}</div>
           </details>}
         </div>
       </div>
@@ -1043,17 +1389,17 @@ function CreditAndSlipsDashboard({ data }) {
 
 function installmentDestination(value, totalInstallments) {
   const destination = String(value || 'Unknown destination').trim()
-  const fraction = destination.match(/\b(\d{1,2})\s*\/\s*(\d{1,2})\b/)
+  const fraction = destination.match(/(?:PARC(?:ELA)?[ .:_-]*)?(\d{1,2})\s*\/\s*(\d{1,2})(?!\d)/i)
   const hasInstallmentOrdinal = Boolean(fraction && Number(fraction[2]) === Number(totalInstallments))
   const label = hasInstallmentOrdinal
-    ? destination.replace(fraction[0], ' ').replace(/\s+/g, ' ').trim()
+    ? destination.replace(/(?:PARC(?:ELA)?[ .:_-]*)?\d{1,2}\s*\/\s*\d{1,2}(?!\d)/ig, ' ').replace(/\s+/g, ' ').trim()
     : destination
   return { label: label || destination, hasInstallmentOrdinal }
 }
 
 function installmentOrdinalPresent(values, totalInstallments) {
   return values.some((value) => {
-    const fraction = String(value || '').match(/\b(\d{1,2})\s*\/\s*(\d{1,2})\b/)
+    const fraction = String(value || '').match(/(?:PARC(?:ELA)?[ .:_-]*)?(\d{1,2})\s*\/\s*(\d{1,2})(?!\d)/i)
     return Boolean(fraction && Number(fraction[2]) === Number(totalInstallments))
   })
 }
@@ -1110,7 +1456,32 @@ function currentFinanceMonth() {
   return year && month ? `${year}-${month}` : ''
 }
 
+function shiftOutlookMonth(value, offset) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})$/)
+  if (!match) return ''
+  const month = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1 + offset, 1))
+  return `${month.getUTCFullYear()}-${String(month.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+function outlookMonthLabel(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})$/)
+  if (!match) return 'Current month'
+  return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' })
+    .format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, 1)))
+}
+
+function recentOutlookMonthOptions() {
+  const current = currentFinanceMonth() || new Date().toISOString().slice(0, 7)
+  return Array.from({ length: 12 }, (_, index) => shiftOutlookMonth(current, -index))
+}
+
+function monthlyExpenseAmount(expense, month) {
+  const amounts = expense.allMonthlyAmounts || expense.monthlyAmounts
+  return Number(amounts?.get(month) || 0)
+}
+
 function buildInstallmentPlans(data) {
+  const displayAliases = data?.displayAliases || {}
   const accountsById = new Map((data?.accounts || []).map((account) => [String(account.id), account]))
   const grouped = new Map()
   for (const transaction of data?.transactions || []) {
@@ -1140,18 +1511,34 @@ function buildInstallmentPlans(data) {
     // because multiple same-merchant purchases can happen on the same day.
     const purchaseKey = hasInstallmentOrdinal ? purchaseDay : purchaseDate
     const reportedTotal = Number(metadata.totalAmount)
-    const totalKey = Number.isFinite(reportedTotal) && reportedTotal > 0
-      ? reportedTotal.toFixed(2)
-      : (Math.abs(amount) * totalInstallments).toFixed(2)
     const sourceKey = normalizeRecurringSource(destination)
-    const groupBaseKey = [account.id, cardNumber, purchaseKey, totalInstallments, totalKey].join('|')
-    const compatibleGroups = [...grouped.values()].filter((candidate) => candidate.groupBaseKey === groupBaseKey
-      && [...candidate.sourceKeys].some((candidateSource) => installmentSourcesMatch(candidateSource, destination)))
-    // Only merge a fuzzy source match when it points to one plan. If the data
-    // could refer to multiple same-day purchases, keep them separate.
+    const groupBaseKey = [account.id, cardNumber, purchaseKey, totalInstallments].join('|')
+    const compatibleGroups = [...grouped.values()].filter((candidate) => {
+      if (candidate.groupBaseKey !== groupBaseKey
+        || ![...candidate.sourceKeys].some((candidateSource) => installmentSourcesMatch(candidateSource, destination))) return false
+      if (Number.isFinite(reportedTotal) && reportedTotal > 0 && candidate.reportedTotal) {
+        const totalTolerance = Math.max(0.05, candidate.reportedTotal * 0.001)
+        if (Math.abs(Math.abs(reportedTotal) - candidate.reportedTotal) > totalTolerance) return false
+      }
+      const existing = candidate.installments.get(installmentNumber)
+      if (existing) return Math.abs(existing.amount - Math.abs(amount)) <= 0.01
+      const amounts = [...candidate.installments.values()].map((row) => row.amount).sort((a, b) => a - b)
+      const middle = Math.floor(amounts.length / 2)
+      const typicalAmount = amounts.length % 2
+        ? amounts[middle]
+        : (amounts[middle - 1] + amounts[middle]) / 2
+      const amountTolerance = Math.max(0.05, typicalAmount * 0.005)
+      return Math.abs(Math.abs(amount) - typicalAmount) <= amountTolerance
+    })
+    // A purchase can report a slightly different first installment than later
+    // ones. Merge matching rows by card, purchase day, term, and source when
+    // the installment numbers do not conflict and amounts remain close.
     let group = compatibleGroups.length === 1 ? compatibleGroups[0] : null
     if (!group) {
-      const key = `${groupBaseKey}|${sourceKey}`
+      const keyRoot = `${groupBaseKey}|${sourceKey}`
+      let key = keyRoot
+      let suffix = 2
+      while (grouped.has(key)) key = `${keyRoot}|${suffix++}`
       group = {
       key,
       groupBaseKey,
@@ -1160,8 +1547,8 @@ function buildInstallmentPlans(data) {
       purchaseDate: purchaseDay || purchaseDate,
       totalInstallments,
       currency: transaction.currencyCode || account.currencyCode || 'BRL',
-      accountName: account.name || account.marketingName || 'Credit card',
-      institutionName: account._institutionName || account._itemName || 'Connected institution',
+      accountName: displayAccountName(account, displayAliases),
+      institutionName: displayInstitutionForAccount(account, displayAliases),
       cardNumber,
       installments: new Map(),
       reportedTotal: null,
@@ -1193,8 +1580,15 @@ function buildInstallmentPlans(data) {
   const plans = [...grouped.values()].map((group) => {
     const installmentRows = [...group.installments.values()].sort((a, b) => a.number - b.number)
     const latest = installmentRows.at(-1)
-    const installmentValue = latest?.amount || 0
-    const totalValue = group.reportedTotal || installmentValue * group.totalInstallments
+    const installmentAmounts = installmentRows.map((row) => row.amount).sort((a, b) => a - b)
+    const middle = Math.floor(installmentAmounts.length / 2)
+    const typicalInstallmentValue = installmentAmounts.length % 2
+      ? installmentAmounts[middle]
+      : ((installmentAmounts[middle - 1] || 0) + (installmentAmounts[middle] || 0)) / 2
+    const installmentValue = latest?.amount || typicalInstallmentValue || 0
+    const observedInstallmentTotal = installmentRows.reduce((sum, row) => sum + row.amount, 0)
+    const missingInstallments = Math.max(0, group.totalInstallments - installmentRows.length)
+    const totalValue = group.reportedTotal || observedInstallmentTotal + missingInstallments * typicalInstallmentValue
     const postedRows = installmentRows.filter((row) => row.status === 'POSTED')
     const highestPostedNumber = Math.max(0, ...postedRows.map((row) => row.number))
     const reportedPaidInstallments = Math.min(group.totalInstallments, Math.max(
@@ -1226,7 +1620,7 @@ function buildInstallmentPlans(data) {
     const paidInstallments = Math.max(reportedPaidInstallments, pastBillPaidCount)
     const observedPaidValue = postedRows.reduce((sum, row) => sum + row.amount, 0)
     const inferredMissingPaid = Math.max(0, paidInstallments - postedRows.length)
-    const paidValue = Math.min(totalValue, observedPaidValue + inferredMissingPaid * installmentValue)
+    const paidValue = Math.min(totalValue, observedPaidValue + inferredMissingPaid * typicalInstallmentValue)
     const totalEstimated = !group.reportedTotal
     const paidEstimated = inferredMissingPaid > 0
     const completedScheduleRows = scheduleRows.map((row) => ({
@@ -1309,7 +1703,7 @@ function buildInstallmentPlans(data) {
         date: refund.date,
         amount: refundAmount,
         currency: refund.currencyCode || account?.currencyCode || 'BRL',
-        card: `${account?.name || account?.marketingName || 'Credit card'} · ${account?._institutionName || account?._itemName || 'Connected institution'}`,
+        card: `${account ? displayAccountName(account, displayAliases) : 'Credit card'} · ${account ? displayInstitutionForAccount(account, displayAliases) : 'Connected institution'}`,
         candidates: matches,
       })
     }
@@ -1449,13 +1843,68 @@ function ExpenseChart({ data, days, setDays, currency, setCurrency }) {
   )
 }
 
-function AccountsPanel({ data, onConnect, connecting, onImportExisting, onImportItemId, importing }) {
+function DisplayAliasEditor({ aliasKey, alias, label, originalName, onSave }) {
+  const [draft, setDraft] = useState(alias || '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => setDraft(alias || ''), [alias, aliasKey])
+
+  const save = async (nextAlias) => {
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(aliasKey, nextAlias)
+      setDraft(nextAlias || '')
+    } catch (saveError) {
+      setError(saveError.message || 'Could not save this display alias.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <form className="grid min-w-0 gap-1.5 rounded-xl border border-[#2d2537] bg-[#17131f] p-2.5 sm:grid-cols-[minmax(130px,0.8fr)_minmax(160px,1.2fr)] sm:items-center" onSubmit={(event) => { event.preventDefault(); void save(draft.trim() || null) }}>
+    <label className="min-w-0 text-[10px] font-semibold text-muted" title={originalName}><span>{label}</span><span className="block truncate font-normal">{originalName}</span></label>
+    <div className="flex min-w-0 gap-1.5">
+      <input className="input h-9 min-w-0 flex-1 text-xs" maxLength={120} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={originalName} aria-label={`${label} display alias; original name is ${originalName}`} />
+      <button className="icon-button h-9 w-9 shrink-0" type="submit" title="Save alias" aria-label={`Save ${label.toLowerCase()} alias`} disabled={saving}><Check size={15} /></button>
+      {alias && <button className="icon-button h-9 w-9 shrink-0" type="button" title="Use original name" aria-label={`Clear ${label.toLowerCase()} alias`} disabled={saving} onClick={() => void save(null)}><X size={15} /></button>}
+    </div>
+    {error && <p className="text-[10px] text-rose-400 sm:col-span-2" role="alert">{error}</p>}
+  </form>
+}
+
+function AccountsPanel({ data, onConnect, connecting, onImportExisting, onImportItemId, importing, onAliasSave }) {
   const [showItemId, setShowItemId] = useState(false)
   const [itemIdDraft, setItemIdDraft] = useState('')
   const accounts = data?.accounts || []
   const bills = data?.bills || []
   const items = data?.items || []
+  const displayAliases = data?.displayAliases || {}
   const itemById = Object.fromEntries(items.map((item) => [item.id, item]))
+  const accountGroups = new Map()
+  for (const account of accounts) {
+    const itemId = String(account.itemId || '')
+    if (!accountGroups.has(itemId)) accountGroups.set(itemId, [])
+    accountGroups.get(itemId).push(account)
+  }
+  const knownInstitutionGroups = items.map((item) => {
+    const itemId = String(item.id)
+    const itemAccounts = accountGroups.get(itemId) || []
+    const institutionName = item.connector?.name || itemAccounts[0]?._institutionName || itemAccounts[0]?._itemName || 'Connected institution'
+    return { itemId, institutionName, accounts: itemAccounts }
+  })
+  const knownItemIds = new Set(knownInstitutionGroups.map((group) => group.itemId))
+  const institutionGroups = [
+    ...knownInstitutionGroups,
+    ...[...accountGroups.entries()]
+      .filter(([itemId]) => itemId && !knownItemIds.has(itemId))
+      .map(([itemId, groupAccounts]) => ({
+        itemId,
+        institutionName: groupAccounts[0]?._institutionName || groupAccounts[0]?._itemName || 'Connected institution',
+        accounts: groupAccounts,
+      })),
+  ]
+  const accountsWithoutItem = accountGroups.get('') || []
   const attentionItems = items.filter((item) => item.status !== 'UPDATED' || (item.executionStatus && item.executionStatus !== 'SUCCESS'))
   return (
     <div className="panel w-full min-w-0 rounded-[24px] bg-white p-5 shadow-soft md:p-6">
@@ -1475,10 +1924,33 @@ function AccountsPanel({ data, onConnect, connecting, onImportExisting, onImport
         const status = item.status === 'UPDATING' ? 'Syncing with institution' : item.status === 'WAITING_USER_INPUT' ? 'Waiting for a verification step' : item.status === 'LOGIN_ERROR' ? 'Sign-in needs attention' : item.status === 'OUTDATED' ? 'Last sync did not complete' : item.executionStatus === 'PARTIAL_SUCCESS' ? 'Some data could not be collected' : `Connection status: ${item.status || item.executionStatus || 'unknown'}`
         const canUpdate = item.status !== 'UPDATING'
         return <div key={item.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-100 bg-amber-50/70 px-3 py-2.5">
-          <div className="min-w-0"><p className="truncate text-xs font-bold">{item.connector?.name || 'Bank connection'}</p><p className="mt-0.5 text-[10px] text-amber-800">{status}</p></div>
+          <div className="min-w-0"><p className="truncate text-xs font-bold">{displayInstitutionName(item.id, item.connector?.name || 'Bank connection', displayAliases)}</p><p className="mt-0.5 text-[10px] text-amber-800">{status}</p></div>
           {canUpdate && <button onClick={() => onConnect(item.id)} disabled={connecting} className="rounded-lg bg-white px-2.5 py-1.5 text-[10px] font-extrabold text-amber-900 shadow-sm">{item.status === 'WAITING_USER_INPUT' ? 'Continue' : 'Update connection'}</button>}
         </div>
       })}</div>}
+      {(institutionGroups.length > 0 || accountsWithoutItem.length > 0) && <details className="mb-4 rounded-xl border border-[#2d2537] bg-[#17131f] p-3">
+        <summary className="cursor-pointer text-xs font-bold">Display aliases</summary>
+        <p className="mt-1 text-[10px] text-muted">Set shorter names for institutions, bank accounts, and cards. These names will replace the full names throughout the app.</p>
+        <div className="mt-3 space-y-4">
+          {institutionGroups.map((group) => <div key={group.itemId} className="min-w-0 space-y-2">
+            <DisplayAliasEditor aliasKey={`institution:${group.itemId}`} alias={displayAliases[`institution:${group.itemId}`]} label="Institution" originalName={group.institutionName} onSave={onAliasSave} />
+            {group.accounts.map((account) => {
+              const credit = account.type === 'CREDIT'
+              const kind = credit ? 'card' : 'account'
+              const originalName = account.name || account.marketingName || (credit ? 'Credit card' : 'Bank account')
+              const aliasKey = `${kind}:${account.id}`
+              return <DisplayAliasEditor key={aliasKey} aliasKey={aliasKey} alias={displayAliases[aliasKey]} label={credit ? 'Card' : 'Account'} originalName={originalName} onSave={onAliasSave} />
+            })}
+          </div>)}
+          {accountsWithoutItem.map((account) => {
+            const credit = account.type === 'CREDIT'
+            const kind = credit ? 'card' : 'account'
+            const aliasKey = `${kind}:${account.id}`
+            const originalName = account.name || account.marketingName || (credit ? 'Credit card' : 'Bank account')
+            return <DisplayAliasEditor key={aliasKey} aliasKey={aliasKey} alias={displayAliases[aliasKey]} label={credit ? 'Card' : 'Account'} originalName={originalName} onSave={onAliasSave} />
+          })}
+        </div>
+      </details>}
       {accounts.length ? <div className="account-scroll space-y-3">
         {accounts.map((account) => {
           const credit = account.type === 'CREDIT'
@@ -1488,13 +1960,13 @@ function AccountsPanel({ data, onConnect, connecting, onImportExisting, onImport
           today.setHours(0, 0, 0, 0)
           const nextBill = accountBills.find((bill) => parseFinanceDate(bill.dueDate) >= today)
           const item = itemById[account.itemId]
-          const institutionName = account._institutionName || item?.connector?.name || account._itemName || 'Connected account'
+          const institutionName = displayInstitutionName(account.itemId, account._institutionName || item?.connector?.name || account._itemName || 'Connected account', displayAliases)
           return <div key={account.id} className="account-row rounded-2xl border border-[#edf1ee] p-4">
             <div className="flex items-start gap-3">
               <div className={`account-icon ${credit ? 'account-icon-card' : 'account-icon-bank'}`}>{credit ? <CreditCard size={18} /> : <Landmark size={18} />}</div>
               <div className="min-w-0 flex-1">
                 <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0"><p className="truncate text-sm font-bold">{account.name || account.marketingName || (credit ? 'Credit card' : 'Bank account')}</p><p className="mt-0.5 truncate text-[11px] text-muted">{institutionName}{account.number ? ` · ${account.number}` : ''}</p></div>
+                  <div className="min-w-0"><p className="truncate text-sm font-bold">{displayAccountName(account, displayAliases)}</p><p className="mt-0.5 truncate text-[11px] text-muted">{institutionName}{account.number ? ` · ${account.number}` : ''}</p></div>
                   <p className="whitespace-nowrap text-right text-sm font-extrabold">{money(account.balance, account.currencyCode)}</p>
                 </div>
                 {credit && <div className="mt-3 grid grid-cols-2 gap-2 border-t border-[#edf1ee] pt-3">
@@ -1532,7 +2004,7 @@ function similarExpenseSource(transaction) {
   return pieces.length > 1 ? pieces.slice(1).join(' · ') : pieces[0] || 'Unknown expense'
 }
 
-function buildSimilarExpenseGroups(transactions, overrides) {
+function buildSimilarExpenseGroups(transactions, overrides, displayAliases = {}) {
   const groups = new Map()
   const genericSources = new Set(['pix', 'transfer', 'transferencia', 'purchase', 'compra', 'debit purchase', 'credit card purchase', 'payment', 'pagamento', 'withdrawal', 'saque'])
   for (const transaction of transactions) {
@@ -1547,7 +2019,7 @@ function buildSimilarExpenseGroups(transactions, overrides) {
     group.categories.set(category, (group.categories.get(category) || 0) + 1)
     const currency = transaction.currencyCode || 'BRL'
     group.totals.set(currency, (group.totals.get(currency) || 0) + expenseValue(transaction))
-    group.accounts.add(recurringAccountLabel(transaction))
+    group.accounts.add(recurringAccountLabel(transaction, displayAliases))
   }
 
   return [...groups.values()]
@@ -1608,10 +2080,11 @@ function SimilarExpenseGroupRow({ group, overrides, onSave }) {
 
 function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, setSearch, onCategorySave, onBulkCategorySave }) {
   const overrides = data?.categoryOverrides || {}
+  const displayAliases = data?.displayAliases || {}
   const transactions = data?.transactions || []
   const [similarSearch, setSimilarSearch] = useState('')
   const [showAllSimilarGroups, setShowAllSimilarGroups] = useState(false)
-  const similarGroups = useMemo(() => buildSimilarExpenseGroups(transactions, overrides), [transactions, overrides])
+  const similarGroups = useMemo(() => buildSimilarExpenseGroups(transactions, overrides, displayAliases), [transactions, overrides, displayAliases])
   const categorySuggestions = categoriesForAutocomplete(transactions, overrides)
   const filteredSimilarGroups = similarGroups.filter((group) => !similarSearch.trim() || `${group.source} ${group.accountList.join(' ')} ${group.categories.map(([category]) => category).join(' ')}`.toLowerCase().includes(similarSearch.trim().toLowerCase()))
   const visibleSimilarGroups = showAllSimilarGroups || similarSearch.trim() ? filteredSimilarGroups : filteredSimilarGroups.slice(0, 12)
@@ -1620,7 +2093,7 @@ function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, se
     const category = transactionCategory(tx, overrides)
     const matchesCategory = categoryFilter === 'All categories' || category === categoryFilter
     const query = search.trim().toLowerCase()
-    const matchesSearch = !query || `${tx.description || ''} ${tx.descriptionRaw || ''} ${tx._accountName || ''} ${category}`.toLowerCase().includes(query)
+    const matchesSearch = !query || `${tx.description || ''} ${tx.descriptionRaw || ''} ${transactionAccountLabel(tx, displayAliases)} ${tx._accountName || ''} ${category}`.toLowerCase().includes(query)
     return matchesCategory && matchesSearch
   })
   return (
@@ -1644,14 +2117,14 @@ function TransactionsPanel({ data, categoryFilter, setCategoryFilter, search, se
       </div>
       <div className="transaction-header hidden grid-cols-[minmax(0,1.5fr)_minmax(110px,0.75fr)_minmax(125px,0.8fr)_minmax(110px,0.7fr)] gap-4 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.1em] text-muted md:grid"><span>Movement</span><span>Date</span><span>Category</span><span className="text-right">Amount</span></div>
       <div className="divide-y divide-[#edf1ee]">
-        {filtered.map((transaction) => <TransactionRow key={transaction.id} transaction={transaction} category={transactionCategory(transaction, overrides)} categories={categories} onSave={onCategorySave} />)}
+        {filtered.map((transaction) => <TransactionRow key={transaction.id} transaction={transaction} category={transactionCategory(transaction, overrides)} categories={categories} displayAliases={displayAliases} onSave={onCategorySave} />)}
       </div>
       {!filtered.length && <EmptyState icon={<ArrowLeftRight size={20} />} title="Nothing found" detail={transactions.length ? 'Try another search or category.' : 'Connect an account and sync your first transactions.'} />}
     </section>
   )
 }
 
-function TransactionRow({ transaction, category, categories, onSave }) {
+function TransactionRow({ transaction, category, categories, displayAliases, onSave }) {
   const [draft, setDraft] = useState(category)
   const [editing, setEditing] = useState(false)
   useEffect(() => setDraft(category), [category])
@@ -1665,7 +2138,7 @@ function TransactionRow({ transaction, category, categories, onSave }) {
   return <div className="transaction-row grid grid-cols-1 gap-2 px-4 py-3.5 md:grid-cols-[minmax(0,1.5fr)_minmax(110px,0.75fr)_minmax(125px,0.8fr)_minmax(110px,0.7fr)] md:items-center md:gap-4">
     <div className="flex min-w-0 items-center gap-3">
       <div className={`movement-icon ${expense ? 'movement-expense' : 'movement-income'}`}>{expense ? <ArrowDownLeft size={16} /> : <ArrowUpRight size={16} />}</div>
-      <div className="min-w-0"><p className="truncate text-sm font-bold">{transaction.description || transaction.descriptionRaw || 'Transaction'}</p><p className="mt-0.5 truncate text-[10px] text-muted">{transaction._accountName || 'Account'} · {transaction._itemName || 'Pluggy'}</p></div>
+      <div className="min-w-0"><p className="truncate text-sm font-bold">{transaction.description || transaction.descriptionRaw || 'Transaction'}</p><p className="mt-0.5 truncate text-[10px] text-muted">{transactionAccountLabel(transaction, displayAliases)}</p></div>
     </div>
     <div className="flex items-center justify-between text-xs text-muted md:block"> <span className="mr-2 font-semibold md:hidden">Date</span><span>{dateLabel(transaction.date, { month: 'short', day: 'numeric', year: 'numeric' })}{transaction.status === 'PENDING' && <span className="ml-2 rounded-full bg-amber-50 px-2 py-0.5 text-[9px] font-bold text-amber-700">Pending</span>}</span></div>
     <div className="flex items-center justify-between gap-2"><span className="mr-2 text-xs font-semibold text-muted md:hidden">Category</span>

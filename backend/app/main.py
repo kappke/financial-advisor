@@ -80,6 +80,16 @@ class RecurringPatternPreference(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class DisplayAliasPreference(Base):
+    """User display names for linked institutions, bank accounts, and cards."""
+
+    __tablename__ = "display_alias_preferences"
+
+    alias_key: Mapped[str] = mapped_column(String(300), primary_key=True)
+    alias: Mapped[str] = mapped_column(String(120))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class PluggySyncState(Base):
     """Rate-limit automatic upstream sync attempts without altering API snapshots."""
 
@@ -146,6 +156,11 @@ class RecurringPatternPreferenceBody(BaseModel):
     alias: str | None = Field(default=None, max_length=120)
     category_allocations: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
     excluded: bool = False
+
+
+class DisplayAliasPreferenceBody(BaseModel):
+    alias_key: str = Field(min_length=1, max_length=300)
+    alias: str | None = Field(default=None, max_length=120)
 
 
 class PluggyClient:
@@ -543,12 +558,17 @@ def dashboard(db: Session = Depends(get_db)):
             "_accountType": account.get("type"),
             "_accountName": account.get("name") or "Conta",
             "_itemName": account.get("_itemName"),
+            "_itemId": account.get("itemId"),
         })
     transactions.sort(key=lambda tx: str(tx.get("date") or ""), reverse=True)
     overrides = {row.transaction_id: row.category for row in db.scalars(select(CategoryOverride)).all()}
     recurring_rules = {
         row.pattern_key: {"alias": row.alias, "categoryAllocations": row.category_allocations or [], "excluded": row.excluded}
         for row in db.scalars(select(RecurringPatternPreference)).all()
+    }
+    display_aliases = {
+        row.alias_key: row.alias
+        for row in db.scalars(select(DisplayAliasPreference)).all()
     }
     bills = list(bills_by_key.values())
     bills.sort(key=lambda bill: str(bill.get("dueDate") or ""), reverse=True)
@@ -559,6 +579,7 @@ def dashboard(db: Session = Depends(get_db)):
         "bills": bills,
         "categoryOverrides": overrides,
         "recurringRules": recurring_rules,
+        "displayAliases": display_aliases,
         "lastSyncedAt": last_synced_at.isoformat() if last_synced_at else None,
     }
 
@@ -667,3 +688,28 @@ def set_recurring_pattern_preference(
         ))
     db.commit()
     return {"patternKey": key, "alias": alias, "categoryAllocations": category_allocations, "excluded": body.excluded}
+
+
+@app.put("/api/display-aliases", dependencies=[Depends(require_auth)])
+def set_display_alias(body: DisplayAliasPreferenceBody, db: Session = Depends(get_db)):
+    alias_key = body.alias_key.strip()
+    if not re.fullmatch(r"(?:institution|account|card):[^:/\s]{1,240}", alias_key):
+        raise HTTPException(status_code=400, detail="Alias key must identify an institution, account, or card.")
+    alias = (body.alias or "").strip() or None
+    existing = db.get(DisplayAliasPreference, alias_key)
+    if not alias:
+        if existing:
+            db.delete(existing)
+        db.commit()
+        return {"aliasKey": alias_key, "alias": None}
+    if existing:
+        existing.alias = alias
+        existing.updated_at = datetime.now(timezone.utc)
+    else:
+        db.add(DisplayAliasPreference(
+            alias_key=alias_key,
+            alias=alias,
+            updated_at=datetime.now(timezone.utc),
+        ))
+    db.commit()
+    return {"aliasKey": alias_key, "alias": alias}
