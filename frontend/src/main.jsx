@@ -1125,6 +1125,8 @@ function RecurringDashboard({ data, onRuleSave }) {
     const rule = recurringRules[expense.key] || {}
     const editing = editingKey === expense.key
     const monthAmount = monthlyExpenseAmount(expense, selectedMonth)
+    const latestTransfer = expense.transferPattern ? expense.rows.find((transaction) => transaction.date === expense.latestDate) : null
+    const allocationLimit = latestTransfer ? expenseValue(latestTransfer) : expense.mean
     const scaledAllocations = expense.categoryAllocations.length
       ? allocatedCategoryAmounts(expense, monthAmount, expense.category)
       : null
@@ -1181,15 +1183,15 @@ function RecurringDashboard({ data, onRuleSave }) {
               const allocations = draftAllocations
                 .map((allocation) => ({ category: allocation.category.trim(), amount: Number(allocation.amount) }))
                 .filter((allocation) => allocation.category && Number.isFinite(allocation.amount) && allocation.amount > 0)
-              if (allocations.reduce((sum, allocation) => sum + allocation.amount, 0) > expense.mean + 0.005) {
-                setRuleError(`Assigned categories exceed the ${money(expense.mean, currency)} monthly average for this expense.`)
+              if (allocations.reduce((sum, allocation) => sum + allocation.amount, 0) > allocationLimit + 0.005) {
+                setRuleError(`Assigned categories exceed the ${money(allocationLimit, currency)} ${latestTransfer ? 'latest transfer' : 'monthly average'} for this expense.`)
                 return
               }
               void persistRule(expense, { categoryAllocations: allocations })
             }
           }}>
             {editingField === 'alias' ? <input className="input h-10 min-w-0 flex-1" maxLength={120} value={draftAlias} onChange={(event) => setDraftAlias(event.target.value)} placeholder={expense.source} aria-label="Recurring pattern alias" /> : <>
-              <p className="text-[11px] text-muted">Set a monthly amount for each category. These allocations do not change the total recurring expense.</p>
+              <p className="text-[11px] text-muted">{latestTransfer ? 'Split one transfer by category. Any amount above this split stays under the original transfer category.' : 'Set a monthly amount for each category. These allocations do not change the total recurring expense.'}</p>
               {draftAllocations.map((allocation, index) => <div key={index} className="grid min-w-0 grid-cols-[minmax(0,1fr)_minmax(115px,160px)_40px] gap-2">
                 <input className="input h-10" list="recurring-category-suggestions" maxLength={120} required value={allocation.category} onChange={(event) => setDraftAllocations((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, category: event.target.value } : item))} placeholder="Category" aria-label={`Category ${index + 1}`} />
                 <input className="input h-10" type="number" min="0.01" step="0.01" required value={allocation.amount} onChange={(event) => setDraftAllocations((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, amount: event.target.value } : item))} aria-label={`Monthly amount for category ${index + 1}`} />
@@ -1197,7 +1199,7 @@ function RecurringDashboard({ data, onRuleSave }) {
               </div>)}
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 <button className="small-outline" type="button" onClick={() => setDraftAllocations((current) => [...current, { category: '', amount: '' }])}><Plus size={14} /> Add category</button>
-                <span className="text-[10px] text-muted">Assigned {money(draftAllocations.reduce((sum, allocation) => sum + (Number(allocation.amount) || 0), 0), currency)} / {money(expense.mean, currency)} monthly average</span>
+                <span className="text-[10px] text-muted">Assigned {money(draftAllocations.reduce((sum, allocation) => sum + (Number(allocation.amount) || 0), 0), currency)} / {money(allocationLimit, currency)} {latestTransfer ? 'latest transfer' : 'monthly average'}</span>
               </div>
             </>}
             <div className="flex flex-wrap gap-2"><button className="small-outline" type="submit" disabled={savingKey === expense.key}>{editingField === 'alias' ? 'Save name' : 'Save category amounts'}</button><button className="small-outline" type="button" onClick={() => setEditingKey(null)}>Cancel</button></div>
@@ -1518,7 +1520,9 @@ function allocatedCategoryAmounts(expense, amount, fallbackCategory) {
   const allocations = (expense.categoryAllocations || []).filter((row) => row.category && Number(row.amount) > 0)
   if (!allocations.length || !Number.isFinite(expense.mean) || expense.mean <= 0) return [{ category: fallbackCategory, amount }]
   const requested = allocations.reduce((sum, row) => sum + Number(row.amount), 0)
-  const assigned = amount * Math.min(1, requested / expense.mean)
+  const assigned = expense.transferPattern
+    ? Math.min(amount, requested)
+    : amount * Math.min(1, requested / expense.mean)
   const totals = new Map()
   for (const row of allocations) {
     totals.set(row.category, (totals.get(row.category) || 0) + assigned * Number(row.amount) / requested)
